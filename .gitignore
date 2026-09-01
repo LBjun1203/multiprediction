@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# 虚拟环境和依赖缓存
+.venv/
+venv/
+.uv-cache/
+
+# 密钥和本地配置
+.env
+.env.*
+!.env.example
+
+# 日志与临时文件
+*.log
+*.tmp
+
+# 医学影像和大型数据集
+/test/
+*.nii
+*.nii.gz
+
+# 模型权重
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 文件夹
+/data_washing/

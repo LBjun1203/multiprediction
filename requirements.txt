@@ -1,0 +1,12 @@
+# Core data and training dependencies. Install a CUDA-matched PyTorch build
+# from https://pytorch.org first when GPU training is required.
+numpy>=1.26,<3
+pandas>=2.1,<4
+openpyxl>=3.1,<4
+torch>=2.2,<3
+torchvision>=0.17,<1
+SimpleITK>=2.3,<3
+
+# CT preprocessing also requires the external dcm2niix executable and the
+# TotalSegmentator CLI. Their installation is machine/CUDA specific and is
+# documented in README.md rather than forced into the training environment.
