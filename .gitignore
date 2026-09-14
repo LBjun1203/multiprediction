@@ -23,6 +23,15 @@ venv/
 *.nii
 *.nii.gz
 
+# 数据压缩包
+*.zip
+
+# 杂七杂八文件
+/.docx_build
+/.artifact_deps
+/huashan_original_data
+/runs
+
 # 模型权重
 *.pt
 *.pth
