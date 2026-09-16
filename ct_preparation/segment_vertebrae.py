@@ -4,85 +4,32 @@
 from __future__ import annotations
 
 import argparse
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import SimpleITK as sitk
+
+from ct_preparation.common import (
+    clean_patient_id,
+    patient_directory,
+    relative_manifest_path,
+    resolve_manifest_path,
+)
+from ct_preparation.manifest import SUCCESS_STATUSES, load_manifest, write_manifest
 
 LABELS = ("vertebrae_L2", "vertebrae_L3", "vertebrae_L4")
 SEGMENTATION_COLUMNS = (
-    "L2_mask_path",
-    "L3_mask_path",
-    "L4_mask_path",
-    "L2_voxels",
-    "L3_voxels",
-    "L4_voxels",
+    "l2_mask_path",
+    "l3_mask_path",
+    "l4_mask_path",
+    "l2_voxels",
+    "l3_voxels",
+    "l4_voxels",
     "segmentation_status",
     "segmentation_message",
 )
-
-
-def clean_patient_id(value: object) -> str:
-    if pd.isna(value):
-        raise ValueError("patient_id contains a missing value")
-    text = str(value).strip()
-    if not text:
-        raise ValueError("patient_id contains an empty value")
-    match = re.fullmatch(r"(\d+)\.0", text)
-    return match.group(1) if match else text
-
-
-def patient_directory(output_root: Path, patient_id: str) -> Path:
-    if patient_id in {".", ".."} or Path(patient_id).name != patient_id:
-        raise ValueError(f"Unsafe patient_id for an output directory: {patient_id!r}")
-    return output_root / patient_id
-
-
-def resolve_manifest_path(value: object, output_root: Path) -> Path:
-    path = Path(str(value))
-    return path if path.is_absolute() else output_root / path
-
-
-def output_path_value(path: Path, output_root: Path, relative_paths: bool) -> str:
-    resolved = path.resolve()
-    if not relative_paths:
-        return str(resolved)
-    try:
-        return str(resolved.relative_to(output_root.resolve()))
-    except ValueError as error:
-        raise ValueError(f"Output path is outside --output-root: {resolved}") from error
-
-
-def load_manifest(path: Path) -> pd.DataFrame:
-    if not path.is_file():
-        raise FileNotFoundError(f"Manifest does not exist: {path}")
-    manifest = pd.read_csv(path, dtype={"patient_id": "string"}, keep_default_na=False)
-    required = {"patient_id", "nifti_path", "conversion_status"}
-    missing = sorted(required - set(manifest.columns))
-    if missing:
-        raise ValueError(f"Manifest is missing required columns: {missing}")
-    manifest["patient_id"] = manifest["patient_id"].map(clean_patient_id)
-    if manifest["patient_id"].duplicated().any():
-        duplicate = manifest.loc[
-            manifest["patient_id"].duplicated(), "patient_id"
-        ].iloc[0]
-        raise ValueError(f"Manifest has duplicate patient_id: {duplicate!r}")
-    for column in SEGMENTATION_COLUMNS:
-        if column not in manifest.columns:
-            manifest[column] = pd.Series("", index=manifest.index, dtype="object")
-        else:
-            manifest[column] = manifest[column].astype("object")
-    return manifest
-
-
-def write_manifest(manifest: pd.DataFrame, path: Path) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    manifest.to_csv(temporary, index=False)
-    temporary.replace(path)
 
 
 def geometry_matches(reference: sitk.Image, mask: sitk.Image) -> bool:
@@ -116,9 +63,7 @@ def inspect_masks(ct_path: Path, segmentation_dir: Path) -> dict[str, int]:
     return voxel_counts
 
 
-def select_indices(
-    manifest: pd.DataFrame, patient_id: str | None, limit: int | None
-) -> list[int]:
+def select_indices(manifest, patient_id: str | None, limit: int | None) -> list[int]:
     indices = manifest.index.tolist()
     if patient_id is not None:
         cleaned = clean_patient_id(patient_id)
@@ -176,18 +121,16 @@ def main() -> None:
         patient_id = str(manifest.loc[index, "patient_id"])
         print(f"[{patient_id}] segmentation")
         try:
-            if manifest.loc[index, "conversion_status"] not in {
-                "success",
-                "skipped_existing",
-            }:
+            if (
+                str(manifest.loc[index, "full_ct_status"]).lower()
+                not in SUCCESS_STATUSES
+            ):
                 manifest.loc[index, "segmentation_status"] = "skipped"
-                manifest.loc[index, "segmentation_message"] = (
-                    "conversion did not succeed"
-                )
-                print(f"[{patient_id}] skipped: conversion did not succeed")
+                manifest.loc[index, "segmentation_message"] = "full_ct did not succeed"
+                print(f"[{patient_id}] skipped: full_ct did not succeed")
                 continue
             ct_path = resolve_manifest_path(
-                manifest.loc[index, "nifti_path"], args.output_root
+                manifest.loc[index, "full_ct_path"], args.output_root
             )
             if not ct_path.is_file():
                 raise FileNotFoundError(f"NIfTI does not exist: {ct_path}")
@@ -225,12 +168,14 @@ def main() -> None:
 
             for label in LABELS:
                 short = label.removeprefix("vertebrae_")
-                manifest.loc[index, f"{short}_mask_path"] = output_path_value(
-                    segmentation_dir / f"{label}.nii.gz",
-                    args.output_root,
-                    args.relative_paths,
+                manifest.loc[index, f"{short.lower()}_mask_path"] = (
+                    relative_manifest_path(
+                        segmentation_dir / f"{label}.nii.gz",
+                        args.output_root,
+                        args.relative_paths,
+                    )
                 )
-                manifest.loc[index, f"{short}_voxels"] = counts[label]
+                manifest.loc[index, f"{short.lower()}_voxels"] = counts[label]
             manifest.loc[index, "segmentation_status"] = status
             manifest.loc[index, "segmentation_message"] = message
             print(
