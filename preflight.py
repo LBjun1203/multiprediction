@@ -8,6 +8,12 @@ import json
 import shutil
 from pathlib import Path
 
+from ct_modal.config import load_ct_config
+from ct_preparation.manifest import (
+    LEGACY_CT_INPUT_SPEC,
+    REPRESENTATIONS,
+    resolve_ct_input_spec,
+)
 from multidataset.huashan_dataset import (
     CT_SUCCESS_STATUSES,
     build_normalization_metadata,
@@ -25,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--ct-manifest", required=True, type=Path)
+    parser.add_argument("--ct-config", type=Path, help="CT representation YAML")
     parser.add_argument(
         "--split-file", type=Path, default=Path("multidataset/patient_split.csv")
     )
@@ -47,6 +54,16 @@ def main() -> None:
     args = parse_args()
     if args.image_size < 32:
         raise ValueError("--image-size must be at least 32")
+    ct_spec = (
+        load_ct_config(args.ct_config)
+        if args.ct_config is not None
+        else resolve_ct_input_spec(
+            {
+                **LEGACY_CT_INPUT_SPEC.to_dict(),
+                "expected_shape": [3, args.image_size, args.image_size],
+            }
+        )
+    )
     table = load_longitudinal_table(args.input, args.sheet)
     split = load_patient_split(args.split_file)
     table_ids = set(table["patient_id"])
@@ -63,8 +80,9 @@ def main() -> None:
         args.ct_manifest,
         ct_root=args.ct_root,
         required_patient_ids=table_ids,
+        ct_config=ct_spec,
     )
-    merged, join_summary = merge_longitudinal_with_ct(table, manifest)
+    merged, join_summary = merge_longitudinal_with_ct(table, manifest, ct_spec)
     frames = {
         name: merged.loc[merged["split"] == name].reset_index(drop=True)
         for name in ("train", "val", "test")
@@ -80,22 +98,30 @@ def main() -> None:
         raise ValueError("Patient leakage detected between train/val/test")
 
     expected_metadata = build_normalization_metadata(
-        frames["train"], args.split_file, args.ct_manifest
+        frames["train"],
+        args.split_file,
+        args.ct_manifest,
+        ct_config=ct_spec,
+        ct_manifest=manifest,
+        longitudinal_path=args.input,
     )
     stats = load_normalization_stats(args.stats_file)
     validate_normalization_metadata(stats, expected_metadata)
 
-    usable = manifest["build_25d_status"].isin(CT_SUCCESS_STATUSES)
+    record = REPRESENTATIONS[ct_spec.representation]
+    usable = (
+        manifest[record.status_column].astype(str).str.lower().isin(CT_SUCCESS_STATUSES)
+    )
     cohort_paths = sorted(
         set(
             manifest.loc[
-                usable & manifest["patient_id"].isin(table_ids), "npy_25d_path"
+                usable & manifest["patient_id"].isin(table_ids), record.path_column
             ].astype(str)
         )
     )
     if not args.skip_array_content_check:
         for path in cohort_paths:
-            load_ct_tensor(path, (3, args.image_size, args.image_size))
+            load_ct_tensor(path, ct_spec.expected_shape, ct_spec.representation)
 
     split_summary = {
         name: {
@@ -117,13 +143,13 @@ def main() -> None:
     )
     report = {
         "status": "passed",
+        "ct_input": ct_spec.to_dict(),
         "join": join_summary,
         "splits": split_summary,
         "comparison_status_patients": comparison_status,
         "ct_arrays_checked": 0 if args.skip_array_content_check else len(cohort_paths),
         "normalization_metadata": expected_metadata,
         "external_tools": {
-            "dcm2niix": shutil.which("dcm2niix"),
             "totalsegmentator": shutil.which("totalsegmentator")
             or shutil.which("TotalSegmentator"),
         },

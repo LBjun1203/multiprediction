@@ -13,12 +13,17 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from ct_modal.config import load_ct_config
 from fusion_query_modal.fusion_time_query import masked_huber_loss
-from multidataset.huashan_dataset import ALL_BIOMARKERS, build_datasets
+from multidataset.huashan_dataset import (
+    ALL_BIOMARKERS,
+    build_datasets,
+    normalization_values_equal,
+)
 from multimodal_model import HuashanForecastModel
 
 TENSOR_BATCH_KEYS = (
-    "ct_25d",
+    "ct",
     "bio_base",
     "base_mask",
     "demographics",
@@ -182,6 +187,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ct-manifest", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument(
+        "--ct-config",
+        type=Path,
+        help="Optional CT contract assertion; checkpoint metadata remains authoritative",
+    )
+    parser.add_argument(
         "--split-file", type=Path, default=Path("multidataset/patient_split.csv")
     )
     parser.add_argument(
@@ -192,7 +202,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--image-size", type=int, help="Legacy roi_25d checkpoint shape assertion"
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--predictions", type=Path, default=Path("predictions.csv"))
     parser.add_argument("--metrics", type=Path)
@@ -203,9 +215,26 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("--batch-size must be positive and --num-workers non-negative")
-    if args.image_size < 32:
+    if args.image_size is not None and args.image_size < 32:
         raise ValueError("--image-size must be at least 32")
     device = resolve_device(args.device)
+    model, checkpoint = load_checkpoint_model(args.checkpoint, device)
+    ct_spec = model.ct_input_spec
+    if args.ct_config is not None:
+        override = load_ct_config(args.ct_config)
+        if override != ct_spec:
+            raise ValueError(
+                f"--ct-config {override} does not match checkpoint CT config {ct_spec}"
+            )
+    if args.image_size is not None:
+        expected = ct_spec.expected_shape
+        if ct_spec.representation != "roi_25d" or expected[-2:] != (
+            args.image_size,
+            args.image_size,
+        ):
+            raise ValueError(
+                "--image-size does not match the checkpoint CT input contract"
+            )
     datasets = build_datasets(
         xlsx_path=args.input,
         ct_manifest_path=args.ct_manifest,
@@ -213,8 +242,8 @@ def main() -> None:
         stats_path=args.stats_file,
         sheet_name=args.sheet,
         fit_stats=False,
-        expected_ct_shape=(3, args.image_size, args.image_size),
         ct_root=args.ct_root,
+        ct_config=ct_spec,
     )
     dataset = datasets[{"val": 1, "test": 2}[args.split]]
     loader = DataLoader(
@@ -224,8 +253,10 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    model, checkpoint = load_checkpoint_model(args.checkpoint, device)
-    if checkpoint.get("normalization_stats") != dataset.normalization_stats:
+    checkpoint_stats = checkpoint.get("normalization_stats")
+    if checkpoint_stats is not None and not normalization_values_equal(
+        checkpoint_stats, dataset.normalization_stats
+    ):
         raise ValueError("Checkpoint normalization statistics differ from --stats-file")
     metrics = evaluate_loader(
         model,

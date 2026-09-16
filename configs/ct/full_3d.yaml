@@ -1,0 +1,4 @@
+representation: full_3d
+encoder: none
+expected_shape: [1, 1, 1, 1]
+preprocessing_version: full3d-v1

@@ -17,6 +17,17 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+from ct_preparation.manifest import (
+    LEGACY_CT_INPUT_SPEC,
+    REPRESENTATIONS,
+    SUCCESS_STATUSES,
+    CTInputSpec,
+    load_manifest,
+    representation_signature,
+    resolve_ct_input_spec,
+    resolve_representation_paths,
+)
+
 CORE_BIOMARKERS = [
     "HBA1C",
     "TG",
@@ -31,7 +42,7 @@ CORE_BIOMARKERS = [
 ALL_BIOMARKERS = CORE_BIOMARKERS + ["CysC"]
 DEFAULT_SHEET = "model_long_0_2y"
 EPSILON = 1e-12
-CT_SUCCESS_STATUSES = {"success", "skipped_existing"}
+CT_SUCCESS_STATUSES = set(SUCCESS_STATUSES)
 DEFAULT_CT_SHAPE = (3, 224, 224)
 
 BASE_COLUMNS = [f"base_{name}" for name in ALL_BIOMARKERS]
@@ -44,19 +55,13 @@ NUMERIC_COLUMNS = (
 )
 REQUIRED_COLUMNS = ["patient_id", "ct_path"] + NUMERIC_COLUMNS
 TENSOR_KEYS = (
-    "ct_25d",
+    "ct",
     "bio_base",
     "base_mask",
     "demographics",
     "time",
     "target",
     "target_mask",
-)
-
-CT_MANIFEST_REQUIRED_COLUMNS = (
-    "patient_id",
-    "npy_25d_path",
-    "build_25d_status",
 )
 
 
@@ -208,61 +213,21 @@ def load_ct_manifest(
     manifest_csv: str | Path,
     ct_root: str | Path | None = None,
     required_patient_ids: set[str] | None = None,
+    ct_config: CTInputSpec | dict[str, Any] | None = None,
+    check_files: bool = True,
 ) -> pd.DataFrame:
-    """Load CT metadata and validate files used by the current cohort only.
-
-    Relative ``npy_25d_path`` values are resolved against ``ct_root`` when it is
-    provided, otherwise against the manifest directory. Absolute paths remain
-    supported for backward compatibility.
-    """
+    """Load the wide manifest, map legacy aliases, and resolve one representation."""
     path = Path(manifest_csv)
-    if not path.is_file():
-        raise FileNotFoundError(f"CT manifest does not exist: {path}")
-    manifest = pd.read_csv(path, dtype={"patient_id": "string"}, keep_default_na=False)
-    missing = sorted(set(CT_MANIFEST_REQUIRED_COLUMNS) - set(manifest.columns))
-    if missing:
-        raise ValueError(f"CT manifest is missing required columns: {missing}")
-
-    manifest = manifest.copy()
-    manifest["patient_id"] = manifest["patient_id"].map(clean_patient_id)
-    manifest["build_25d_status"] = (
-        manifest["build_25d_status"].astype(str).str.strip().str.lower()
-    )
-    manifest["npy_25d_path"] = manifest["npy_25d_path"].astype(str).str.strip()
-    if manifest["patient_id"].duplicated().any():
-        duplicate = manifest.loc[
-            manifest["patient_id"].duplicated(), "patient_id"
-        ].iloc[0]
-        raise ValueError(f"CT manifest has duplicate patient_id: {duplicate!r}")
-
-    usable = manifest["build_25d_status"].isin(CT_SUCCESS_STATUSES)
-    validate_rows = usable
-    if required_patient_ids is not None:
-        validate_rows = validate_rows & manifest["patient_id"].isin(
-            required_patient_ids
-        )
-    empty_path = manifest["npy_25d_path"].str.lower().isin({"", "nan", "none", "<na>"})
-    if (validate_rows & empty_path).any():
-        patient_id = manifest.loc[validate_rows & empty_path, "patient_id"].iloc[0]
-        raise ValueError(
-            f"CT manifest marks patient_id={patient_id!r} successful but npy_25d_path is empty"
-        )
+    spec = resolve_ct_input_spec(ct_config)
+    manifest = load_manifest(path)
     base_directory = Path(ct_root) if ct_root is not None else path.parent
-    for index in manifest.index[usable & ~empty_path]:
-        array_path = Path(str(manifest.loc[index, "npy_25d_path"]))
-        if not array_path.is_absolute():
-            array_path = base_directory / array_path
-        manifest.loc[index, "npy_25d_path"] = str(array_path.resolve())
-
-    for row in manifest.loc[validate_rows, ["patient_id", "npy_25d_path"]].itertuples(
-        index=False
-    ):
-        if not Path(row.npy_25d_path).is_file():
-            raise FileNotFoundError(
-                f"CT manifest marks patient_id={row.patient_id!r} successful but the array "
-                f"does not exist: {row.npy_25d_path}"
-            )
-    return manifest
+    return resolve_representation_paths(
+        manifest,
+        spec,
+        base_directory,
+        required_patient_ids=required_patient_ids,
+        check_files=check_files,
+    )
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -273,25 +238,51 @@ def _sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _patient_id_hash(patient_ids: set[str]) -> str:
-    payload = "\n".join(sorted(patient_ids)).encode("utf-8")
+def _patient_id_hash(patient_ids: set[str] | list[str]) -> str:
+    payload = "\n".join(sorted(set(patient_ids))).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def build_normalization_metadata(
     train_df: pd.DataFrame,
     split_csv: str | Path,
-    ct_manifest_path: str | Path,
+    ct_manifest_path: str | Path | None = None,
+    ct_config: CTInputSpec | dict[str, Any] | None = None,
+    ct_manifest: pd.DataFrame | None = None,
+    longitudinal_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    """Build cohort provenance independent of unrelated wide-manifest columns."""
+    spec = resolve_ct_input_spec(ct_config)
     patient_ids = set(train_df["patient_id"].astype(str))
-    return {
-        "schema_version": 2,
-        "cohort_definition": "ct_eligible_train",
+    cohort_payload = {
+        "longitudinal_sha256": (
+            _sha256_file(longitudinal_path) if longitudinal_path is not None else None
+        ),
+        "split_file_sha256": _sha256_file(split_csv),
+        "train_patient_ids_sha256": _patient_id_hash(patient_ids),
         "train_patient_count": len(patient_ids),
         "train_observation_count": len(train_df),
-        "train_patient_ids_sha256": _patient_id_hash(patient_ids),
-        "split_file_sha256": _sha256_file(split_csv),
-        "ct_manifest_sha256": _sha256_file(ct_manifest_path),
+    }
+    cohort_signature = hashlib.sha256(
+        json.dumps(cohort_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if ct_manifest is None and ct_manifest_path is not None:
+        ct_manifest = load_manifest(ct_manifest_path)
+    return {
+        "schema_version": 3,
+        "cohort_definition": "ct_eligible_train",
+        **cohort_payload,
+        "cohort_signature": cohort_signature,
+        "representation": spec.representation,
+        "representation_signature": (
+            representation_signature(
+                ct_manifest.loc[ct_manifest["patient_id"].isin(patient_ids)], spec
+            )
+            if ct_manifest is not None
+            else None
+        ),
     }
 
 
@@ -306,10 +297,21 @@ def validate_normalization_metadata(
             stacklevel=2,
         )
         return
+    if int(metadata.get("schema_version", 0)) < 3:
+        warnings.warn(
+            "Legacy normalization metadata is accepted for checkpoint compatibility; "
+            "refit statistics to record stable cohort/representation signatures.",
+            stacklevel=2,
+        )
+        return
+    # Biochemical normalization is tied to the effective cohort. Representation
+    # provenance is recorded for audit/comparison, but does not change the fitted
+    # biochemical values when cohort membership is unchanged.
+    keys = ("cohort_signature",)
     mismatches = {
-        key: (metadata.get(key), expected_value)
-        for key, expected_value in expected_metadata.items()
-        if metadata.get(key) != expected_value
+        key: (metadata.get(key), expected_metadata.get(key))
+        for key in keys
+        if metadata.get(key) != expected_metadata.get(key)
     }
     if mismatches:
         details = "; ".join(
@@ -323,13 +325,23 @@ def validate_normalization_metadata(
 
 
 def merge_longitudinal_with_ct(
-    longitudinal_df: pd.DataFrame, ct_manifest: pd.DataFrame
+    longitudinal_df: pd.DataFrame,
+    ct_manifest: pd.DataFrame,
+    ct_config: CTInputSpec | dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Attach one baseline CT to every usable follow-up observation."""
+    spec = resolve_ct_input_spec(ct_config)
+    record = REPRESENTATIONS[spec.representation]
     usable_manifest = ct_manifest.loc[
-        ct_manifest["build_25d_status"].isin(CT_SUCCESS_STATUSES),
-        ["patient_id", "npy_25d_path"],
+        ct_manifest[record.status_column]
+        .astype(str)
+        .str.lower()
+        .isin(CT_SUCCESS_STATUSES),
+        ["patient_id", record.path_column],
     ].copy()
+    usable_manifest = usable_manifest.rename(
+        columns={record.path_column: "ct_path_resolved"}
+    )
     all_patient_ids = set(longitudinal_df["patient_id"])
     usable_ct_ids = set(usable_manifest["patient_id"])
     merged = longitudinal_df.merge(
@@ -355,19 +367,23 @@ def merge_longitudinal_with_ct(
 
 def load_ct_tensor(
     npy_path: str | Path,
-    expected_shape: tuple[int, int, int] = DEFAULT_CT_SHAPE,
+    expected_shape: tuple[int, ...] = DEFAULT_CT_SHAPE,
+    representation: str = "roi_25d",
 ) -> torch.Tensor:
-    """Read one deterministic [C,H,W] CT array and enforce its storage contract."""
+    """Read one deterministic model array and enforce its representation contract."""
     path = Path(npy_path)
     if not path.is_file():
-        raise FileNotFoundError(f"2.5D CT array does not exist: {path}")
+        raise FileNotFoundError(f"{representation} CT array does not exist: {path}")
     array = np.load(path, allow_pickle=False)
-    if array.shape != expected_shape:
+    stored_shape = expected_shape if representation == "roi_25d" else expected_shape[1:]
+    if array.shape != stored_shape:
         raise ValueError(
-            f"2.5D CT array has shape {array.shape}, expected {expected_shape}: {path}"
+            f"{representation} CT array has shape {array.shape}, expected {stored_shape}: {path}"
         )
     if array.dtype != np.float32:
-        raise ValueError(f"2.5D CT array must be float32, got {array.dtype}: {path}")
+        raise ValueError(
+            f"{representation} CT array must be float32, got {array.dtype}: {path}"
+        )
     if not np.isfinite(array).all():
         raise ValueError(f"2.5D CT array contains non-finite values: {path}")
     minimum = float(array.min())
@@ -376,7 +392,8 @@ def load_ct_tensor(
         raise ValueError(
             f"2.5D CT array must be in [0, 1], got [{minimum}, {maximum}]: {path}"
         )
-    return torch.from_numpy(np.ascontiguousarray(array)).to(dtype=torch.float32)
+    tensor = torch.from_numpy(np.ascontiguousarray(array)).to(dtype=torch.float32)
+    return tensor if representation == "roi_25d" else tensor.unsqueeze(0)
 
 
 def _safe_mean_std(series: pd.Series, label: str) -> tuple[float, float]:
@@ -500,6 +517,13 @@ def load_normalization_stats(path: str | Path) -> dict[str, Any]:
     return stats
 
 
+def normalization_values_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Compare fitted values while treating provenance metadata as run-specific."""
+    return {key: value for key, value in left.items() if key != "metadata"} == {
+        key: value for key, value in right.items() if key != "metadata"
+    }
+
+
 class HuashanMultimodalDataset(Dataset):
     """Observation-level multimodal Dataset with one baseline CT per patient."""
 
@@ -507,32 +531,34 @@ class HuashanMultimodalDataset(Dataset):
         self,
         dataframe: pd.DataFrame,
         normalization_stats: dict[str, Any],
-        expected_ct_shape: tuple[int, int, int] = DEFAULT_CT_SHAPE,
+        expected_ct_shape: tuple[int, ...] = DEFAULT_CT_SHAPE,
+        ct_config: CTInputSpec | dict[str, Any] | None = None,
     ):
         _validate_stats(normalization_stats)
         _validate_dataframe(dataframe, "dataset dataframe")
-        if "npy_25d_path" not in dataframe.columns:
-            raise ValueError("dataset dataframe is missing npy_25d_path")
-        if len(expected_ct_shape) != 3 or any(
-            not isinstance(value, int) or isinstance(value, bool) or value <= 0
-            for value in expected_ct_shape
-        ):
-            raise ValueError(
-                f"expected_ct_shape must contain three positive integers, got {expected_ct_shape}"
-            )
-        if expected_ct_shape[0] != 3:
-            raise ValueError(
-                "The current CTEncoder requires exactly 3 CT slices; "
-                f"got expected_ct_shape={expected_ct_shape}"
-            )
-        if min(expected_ct_shape[1:]) < 32:
-            raise ValueError(
-                "The current CTEncoder requires spatial dimensions of at least 32; "
-                f"got expected_ct_shape={expected_ct_shape}"
-            )
-        self.dataframe = dataframe.reset_index(drop=True).copy()
+        if ct_config is None:
+            ct_config = {
+                **LEGACY_CT_INPUT_SPEC.to_dict(),
+                "expected_shape": list(expected_ct_shape),
+            }
+        self.ct_input_spec = resolve_ct_input_spec(ct_config)
+        working = dataframe.copy()
+        if "ct_path_resolved" not in working.columns:
+            legacy_column = REPRESENTATIONS[
+                self.ct_input_spec.representation
+            ].path_column
+            if legacy_column in working.columns:
+                working["ct_path_resolved"] = working[legacy_column]
+            elif (
+                self.ct_input_spec.representation == "roi_25d"
+                and "npy_25d_path" in working.columns
+            ):
+                working["ct_path_resolved"] = working["npy_25d_path"]
+            else:
+                raise ValueError("dataset dataframe is missing the resolved CT path")
+        self.dataframe = working.reset_index(drop=True)
         self.normalization_stats = normalization_stats
-        self.expected_ct_shape = expected_ct_shape
+        self.expected_ct_shape = self.ct_input_spec.expected_shape
         self.patient_ids = self.dataframe["patient_id"].astype(str).tolist()
 
     def __len__(self) -> int:
@@ -542,7 +568,7 @@ class HuashanMultimodalDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, str | torch.Tensor]:
         row = self.dataframe.iloc[index]
         patient_id = str(row["patient_id"])
-        ct_25d_path = str(row["npy_25d_path"])
+        ct_path = str(row["ct_path_resolved"])
 
         base_mask_values = [1.0] * len(CORE_BIOMARKERS) + [float(row["base_CysC_mask"])]
         target_mask_values = [1.0] * len(CORE_BIOMARKERS) + [
@@ -581,7 +607,11 @@ class HuashanMultimodalDataset(Dataset):
 
         age_stats = self.normalization_stats["age"]
         tensors = {
-            "ct_25d": load_ct_tensor(ct_25d_path, self.expected_ct_shape),
+            "ct": load_ct_tensor(
+                ct_path,
+                self.expected_ct_shape,
+                self.ct_input_spec.representation,
+            ),
             "bio_base": torch.tensor(base_values, dtype=torch.float32),
             "base_mask": torch.tensor(base_mask_values, dtype=torch.float32),
             "demographics": torch.tensor(
@@ -614,7 +644,8 @@ class HuashanMultimodalDataset(Dataset):
         return {
             "patient_id": patient_id,
             "source_ct_path": str(row["ct_path"]),
-            "ct_25d_path": ct_25d_path,
+            "ct_path": ct_path,
+            "ct_representation": self.ct_input_spec.representation,
             **tensors,
         }
 
@@ -640,13 +671,20 @@ def build_datasets(
     stats_path: str | Path,
     sheet_name: str = DEFAULT_SHEET,
     fit_stats: bool = False,
-    expected_ct_shape: tuple[int, int, int] = DEFAULT_CT_SHAPE,
+    expected_ct_shape: tuple[int, ...] = DEFAULT_CT_SHAPE,
     ct_root: str | Path | None = None,
+    ct_config: CTInputSpec | dict[str, Any] | None = None,
 ) -> tuple[
     HuashanMultimodalDataset,
     HuashanMultimodalDataset,
     HuashanMultimodalDataset,
 ]:
+    if ct_config is None:
+        ct_config = {
+            **LEGACY_CT_INPUT_SPEC.to_dict(),
+            "expected_shape": list(expected_ct_shape),
+        }
+    spec = resolve_ct_input_spec(ct_config)
     full_df = load_longitudinal_table(xlsx_path, sheet_name)
     split_df = load_patient_split(split_csv)
 
@@ -668,8 +706,9 @@ def build_datasets(
         ct_manifest_path,
         ct_root=ct_root,
         required_patient_ids=data_ids,
+        ct_config=spec,
     )
-    working_df, ct_summary = merge_longitudinal_with_ct(working_df, ct_manifest)
+    working_df, ct_summary = merge_longitudinal_with_ct(working_df, ct_manifest, spec)
     print("Multimodal join summary:")
     for key, value in ct_summary.items():
         print(f"  {key}: {value}")
@@ -694,7 +733,12 @@ def build_datasets(
     assert set().union(*id_sets.values()) == set(working_df["patient_id"])
 
     expected_metadata = build_normalization_metadata(
-        frames["train"], split_csv, ct_manifest_path
+        frames["train"],
+        split_csv,
+        ct_manifest_path,
+        ct_config=spec,
+        ct_manifest=ct_manifest,
+        longitudinal_path=xlsx_path,
     )
     if fit_stats:
         stats = fit_normalization_stats(frames["train"])
@@ -703,9 +747,10 @@ def build_datasets(
     else:
         stats = load_normalization_stats(stats_path)
         validate_normalization_metadata(stats, expected_metadata)
+        stats = {**stats, "metadata": expected_metadata}
 
     return tuple(
-        HuashanMultimodalDataset(frames[name], stats, expected_ct_shape)
+        HuashanMultimodalDataset(frames[name], stats, ct_config=spec)
         for name in ("train", "val", "test")
     )
 
@@ -728,7 +773,7 @@ def run_smoke_test(
     print()
 
     expected_shapes = {
-        "ct_25d": train_dataset.expected_ct_shape,
+        "ct": train_dataset.expected_ct_shape,
         "bio_base": (10,),
         "base_mask": (10,),
         "demographics": (2,),
@@ -756,10 +801,10 @@ def run_smoke_test(
     print()
     print(f"Example patient_id: {example['patient_id']}")
     print(f"Example source_ct_path: {example['source_ct_path']}")
-    print(f"Example ct_25d_path: {example['ct_25d_path']}")
+    print(f"Example ct_path: {example['ct_path']}")
     print(
-        f"Example ct_25d range: [{example['ct_25d'].min().item():.6f}, "
-        f"{example['ct_25d'].max().item():.6f}]"
+        f"Example ct range: [{example['ct'].min().item():.6f}, "
+        f"{example['ct'].max().item():.6f}]"
     )
     print(f"Example t_years: {example['time'].item():.6f}")
     print()
@@ -802,10 +847,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-slices", type=int, default=DEFAULT_CT_SHAPE[0])
     parser.add_argument("--image-size", type=int, default=DEFAULT_CT_SHAPE[1])
+    parser.add_argument("--ct-config", type=Path, help="CT representation YAML")
     parser.add_argument(
         "--ct-root",
         type=Path,
-        help="Root used to resolve relative npy_25d_path values in the CT manifest",
+        help="Root used to resolve relative representation paths in the CT manifest",
     )
     parser.add_argument(
         "--fit-stats",
@@ -817,11 +863,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from ct_modal.config import load_ct_config
+
     args = parse_args()
-    if args.num_slices != 3:
+    if args.ct_config is None and args.num_slices != 3:
         raise ValueError("The current end-to-end model requires --num-slices 3")
     if args.image_size < 32:
         raise ValueError("--image-size must be at least 32")
+    ct_config = load_ct_config(args.ct_config) if args.ct_config is not None else None
     train_dataset, val_dataset, test_dataset = build_datasets(
         xlsx_path=args.input,
         ct_manifest_path=args.ct_manifest,
@@ -831,6 +880,7 @@ def main() -> None:
         fit_stats=args.fit_stats,
         expected_ct_shape=(args.num_slices, args.image_size, args.image_size),
         ct_root=args.ct_root,
+        ct_config=ct_config,
     )
     if args.fit_stats:
         print(f"Saved train-only normalization statistics: {args.stats_file}\n")

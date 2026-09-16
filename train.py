@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,15 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
+from ct_modal.config import (
+    ExperimentConfig,
+    load_experiment_config,
+    save_resolved_config,
+)
+from ct_preparation.manifest import (
+    LEGACY_CT_INPUT_SPEC,
+    resolve_ct_input_spec,
+)
 from evaluate import (
     evaluate_loader,
     load_checkpoint_model,
@@ -25,13 +35,20 @@ from multidataset.huashan_dataset import (
     ALL_BIOMARKERS,
     build_datasets,
     make_patient_balanced_sampler,
+    normalization_values_equal,
 )
 from multimodal_model import HuashanForecastModel
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--ct-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Experiment YAML; defaults to the legacy roi_25d contract when omitted",
+    )
     parser.add_argument(
         "--split-file", type=Path, default=Path("multidataset/patient_split.csv")
     )
@@ -56,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--finetune-ct-backbone",
         action="store_true",
-        help="Train the ResNet backbone; by default it is frozen",
+        help="Train the selected CT backbone; by default it is frozen",
     )
     parser.add_argument(
         "--reuse-stats",
@@ -186,11 +203,57 @@ def validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.config is not None:
+        experiment = load_experiment_config(args.config)
+        ct_spec = experiment.ct
+        config_values = experiment.values
+        cli_options = {
+            argument.split("=", 1)[0]
+            for argument in sys.argv[1:]
+            if argument.startswith("--")
+        }
+        option_by_key = {
+            "seed": "--seed",
+            "batch_size": "--batch-size",
+            "learning_rate": "--learning-rate",
+            "weight_decay": "--weight-decay",
+        }
+        for key, option in option_by_key.items():
+            if key in config_values and option not in cli_options:
+                setattr(args, key, config_values[key])
+        if "pretrained_ct" in config_values and "--no-pretrained" not in cli_options:
+            args.no_pretrained = not bool(config_values["pretrained_ct"])
+        if (
+            "freeze_ct_backbone" in config_values
+            and "--finetune-ct-backbone" not in cli_options
+        ):
+            args.finetune_ct_backbone = not bool(config_values["freeze_ct_backbone"])
+    else:
+        ct_spec = resolve_ct_input_spec(
+            {
+                **LEGACY_CT_INPUT_SPEC.to_dict(),
+                "expected_shape": [3, args.image_size, args.image_size],
+            }
+        )
+        experiment = ExperimentConfig(
+            ct=ct_spec, values={}, source=Path("<cli-default>")
+        )
+    validate_args(args)
+    resumed: tuple[HuashanForecastModel, dict[str, Any]] | None = None
     seed_everything(args.seed)
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == "cuda")
     if args.amp and not use_amp:
         print("AMP requested but CUDA is unavailable; continuing without AMP.")
+
+    if args.resume is not None:
+        resumed = load_checkpoint_model(args.resume, device)
+        checkpoint_spec = resumed[0].ct_input_spec
+        if args.config is not None and checkpoint_spec != ct_spec:
+            raise ValueError(
+                f"Resume checkpoint CT config {checkpoint_spec} differs from --config {ct_spec}"
+            )
+        ct_spec = checkpoint_spec
 
     train_dataset, val_dataset, test_dataset = build_datasets(
         xlsx_path=args.input,
@@ -199,8 +262,8 @@ def main() -> None:
         stats_path=args.stats_file,
         sheet_name=args.sheet,
         fit_stats=not args.reuse_stats,
-        expected_ct_shape=(3, args.image_size, args.image_size),
         ct_root=args.ct_root,
+        ct_config=ct_spec,
     )
     sampler = make_patient_balanced_sampler(train_dataset)
     train_loader = DataLoader(
@@ -231,8 +294,8 @@ def main() -> None:
     best_val_loss = float("inf")
     history: list[dict[str, float | int]] = []
     epochs_without_improvement = 0
-    if args.resume is not None:
-        model, checkpoint = load_checkpoint_model(args.resume, device)
+    if resumed is not None:
+        model, checkpoint = resumed
         optimizer = AdamW(
             (parameter for parameter in model.parameters() if parameter.requires_grad),
             lr=args.learning_rate,
@@ -248,7 +311,10 @@ def main() -> None:
             checkpoint.get("epochs_without_improvement", 0)
         )
         restore_rng_state(checkpoint.get("rng_state"))
-        if checkpoint.get("normalization_stats") != train_dataset.normalization_stats:
+        checkpoint_stats = checkpoint.get("normalization_stats")
+        if checkpoint_stats is None or not normalization_values_equal(
+            checkpoint_stats, train_dataset.normalization_stats
+        ):
             raise ValueError(
                 "Resume checkpoint normalization differs from the current cohort"
             )
@@ -256,6 +322,7 @@ def main() -> None:
         model = HuashanForecastModel(
             pretrained_ct=not args.no_pretrained,
             freeze_ct_backbone=not args.finetune_ct_backbone,
+            ct_config=ct_spec,
         ).to(device)
         optimizer = AdamW(
             (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -264,6 +331,15 @@ def main() -> None:
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_values = {
+        **experiment.values,
+        "training_args": serializable_args(args),
+        "normalization_metadata": train_dataset.normalization_stats.get("metadata"),
+    }
+    save_resolved_config(
+        ExperimentConfig(ct=ct_spec, values=resolved_values, source=experiment.source),
+        args.output_dir / "resolved_config.json",
+    )
     best_path = args.output_dir / "best.pt"
     last_path = args.output_dir / "last.pt"
 

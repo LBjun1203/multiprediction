@@ -1,0 +1,7 @@
+ct_config: ../ct/roi_3d.yaml
+seed: 42
+batch_size: 4
+learning_rate: 0.001
+weight_decay: 0.0001
+freeze_ct_backbone: false
+pretrained_ct: false

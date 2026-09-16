@@ -13,7 +13,8 @@ from biochemistry_modal.biochemistry_encoder import (
     BIOMARKERS as BIOCHEMISTRY_BIOMARKERS,
 )
 from biochemistry_modal.biochemistry_encoder import BiochemistryEncoder
-from CT_modal.ct_encoder import CTEncoder
+from ct_modal.factory import build_ct_encoder
+from ct_preparation.manifest import CTInputSpec, resolve_ct_input_spec
 from fusion_query_modal.fusion_time_query import BIOMARKERS as FUSION_BIOMARKERS
 from fusion_query_modal.fusion_time_query import FusionTimeQueryHead
 from multidataset.huashan_dataset import ALL_BIOMARKERS
@@ -32,10 +33,13 @@ class HuashanForecastModel(nn.Module):
         bio_hidden_dim: int = 64,
         bio_dropout: float = 0.1,
         fusion_dropout: float = 0.1,
+        ct_config: CTInputSpec | Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._validate_contract()
-        self.ct_encoder = CTEncoder(
+        self.ct_input_spec = resolve_ct_input_spec(ct_config)
+        self.ct_encoder = build_ct_encoder(
+            self.ct_input_spec,
             embedding_dim=ct_embedding_dim,
             pretrained=pretrained_ct,
             dropout=ct_dropout,
@@ -62,6 +66,7 @@ class HuashanForecastModel(nn.Module):
             "bio_hidden_dim": bio_hidden_dim,
             "bio_dropout": bio_dropout,
             "fusion_dropout": fusion_dropout,
+            "ct_config": self.ct_input_spec.to_dict(),
         }
 
     @staticmethod
@@ -96,12 +101,12 @@ class HuashanForecastModel(nn.Module):
         batch: Mapping[str, torch.Tensor],
         return_features: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        required = {"ct_25d", "bio_base", "base_mask", "demographics", "time"}
+        required = {"ct", "bio_base", "base_mask", "demographics", "time"}
         missing = sorted(required - set(batch))
         if missing:
             raise ValueError(f"Model batch is missing keys: {missing}")
 
-        ct_embedding = self.ct_encoder(batch["ct_25d"])
+        ct_embedding = self.ct_encoder(batch["ct"])
         bio_embedding = self.bio_encoder(batch["bio_base"], batch["base_mask"])
         result = self.fusion_head(
             ct_embedding,

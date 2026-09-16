@@ -8,6 +8,5 @@ torch>=2.2,<3
 torchvision>=0.17,<1
 SimpleITK>=2.3,<3
 
-# CT preprocessing also requires the external dcm2niix executable and the
-# TotalSegmentator CLI. Their installation is machine/CUDA specific and is
-# documented in README.md rather than forced into the training environment.
+# Vertebral segmentation also requires the external TotalSegmentator CLI. Its
+# installation is machine/CUDA specific and is not forced into training installs.

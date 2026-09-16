@@ -97,6 +97,7 @@ def main() -> None:
             lr=1e-3,
         )
         prediction = model(batch)
+        assert batch["ct"].shape == (2, 3, 64, 64)
         assert prediction.shape == (2, len(ALL_BIOMARKERS))
         loss = masked_huber_loss(prediction, batch["target"], batch["target_mask"])
         assert loss.ndim == 0 and torch.isfinite(loss)

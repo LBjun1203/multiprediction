@@ -1,0 +1,4 @@
+representation: roi_25d
+encoder: resnet18_2d
+expected_shape: [3, 224, 224]
+preprocessing_version: roi25d-v1

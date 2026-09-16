@@ -12,7 +12,7 @@ try:
     from torchvision.models import ResNet18_Weights, resnet18
 except ImportError as error:  # pragma: no cover - depends on the runtime environment
     raise ImportError(
-        "CTEncoder requires torchvision. Install a torchvision version compatible "
+        "CTEncoder2D requires torchvision. Install a torchvision version compatible "
         "with the installed PyTorch version."
     ) from error
 
@@ -23,12 +23,12 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-class CTEncoder(nn.Module):
+class CTEncoder2D(nn.Module):
     """Map a three-slice CT stack to a fixed-width embedding.
 
     The three channels are adjacent axial slices centered at L3, rather than
     RGB channels. Inputs must already follow the preprocessing contract used
-    by ``CT_preparation/build_25d.py``: floating-point values in ``[0, 1]``
+    by ``ct_preparation/build_roi_25d.py``: floating-point values in ``[0, 1]``
     with shape ``[3, H, W]`` or ``[B, 3, H, W]``.
 
     ImageNet normalization is applied inside this module immediately before
@@ -56,9 +56,7 @@ class CTEncoder(nn.Module):
         if not isinstance(pretrained, bool):
             raise ValueError(f"pretrained must be bool, got {pretrained!r}")
         if not isinstance(freeze_backbone, bool):
-            raise ValueError(
-                f"freeze_backbone must be bool, got {freeze_backbone!r}"
-            )
+            raise ValueError(f"freeze_backbone must be bool, got {freeze_backbone!r}")
         if not isinstance(dropout, (int, float)) or isinstance(dropout, bool):
             raise ValueError(f"dropout must be a number in [0, 1], got {dropout!r}")
         if not 0.0 <= float(dropout) <= 1.0:
@@ -109,72 +107,70 @@ class CTEncoder(nn.Module):
         else:
             self.backbone.train(self.training)
 
-    def train(self, mode: bool = True) -> CTEncoder:
+    def train(self, mode: bool = True) -> CTEncoder2D:
         """Preserve an eval-mode backbone while a frozen projection is trained."""
         super().train(mode)
         if self._backbone_frozen:
             self.backbone.eval()
         return self
 
-    def forward(self, ct_25d: torch.Tensor) -> torch.Tensor:
+    def forward(self, ct: torch.Tensor) -> torch.Tensor:
         """Return ``[embedding_dim]`` or ``[B, embedding_dim]`` CT features."""
-        single_sample = self._validate_input(ct_25d)
+        single_sample = self._validate_input(ct)
         if single_sample:
-            ct_25d = ct_25d.unsqueeze(0)
+            ct = ct.unsqueeze(0)
 
-        mean = self.image_mean.to(dtype=ct_25d.dtype)
-        std = self.image_std.to(dtype=ct_25d.dtype)
-        normalized = (ct_25d - mean) / std
+        mean = self.image_mean.to(dtype=ct.dtype)
+        std = self.image_std.to(dtype=ct.dtype)
+        normalized = (ct - mean) / std
         embedding = self.projection(self.backbone(normalized))
 
         if not torch.isfinite(embedding).all().item():
             raise ValueError("CT embedding contains non-finite values")
         return embedding.squeeze(0) if single_sample else embedding
 
-    def _validate_input(self, ct_25d: torch.Tensor) -> bool:
-        if not isinstance(ct_25d, torch.Tensor):
+    def _validate_input(self, ct: torch.Tensor) -> bool:
+        if not isinstance(ct, torch.Tensor):
+            raise ValueError(f"ct must be a torch.Tensor, got {type(ct).__name__}")
+        if ct.ndim not in (3, 4):
             raise ValueError(
-                f"ct_25d must be a torch.Tensor, got {type(ct_25d).__name__}"
+                "roi_25d ct must have shape [3, H, W] or [B, 3, H, W], "
+                f"got {tuple(ct.shape)}"
             )
-        if ct_25d.ndim not in (3, 4):
+        channel_axis = 0 if ct.ndim == 3 else 1
+        if ct.shape[channel_axis] != self.input_channels:
             raise ValueError(
-                "ct_25d must have shape [3, H, W] or [B, 3, H, W], "
-                f"got {tuple(ct_25d.shape)}"
+                f"roi_25d ct must have {self.input_channels} channels, "
+                f"got {ct.shape[channel_axis]}"
             )
-        channel_axis = 0 if ct_25d.ndim == 3 else 1
-        if ct_25d.shape[channel_axis] != self.input_channels:
+        if min(ct.shape[-2:]) < 32:
             raise ValueError(
-                f"ct_25d must have {self.input_channels} channels, "
-                f"got {ct_25d.shape[channel_axis]}"
+                "roi_25d spatial dimensions must both be at least 32, "
+                f"got {tuple(ct.shape[-2:])}"
             )
-        if min(ct_25d.shape[-2:]) < 32:
-            raise ValueError(
-                "ct_25d spatial dimensions must both be at least 32, "
-                f"got {tuple(ct_25d.shape[-2:])}"
-            )
-        if not torch.is_floating_point(ct_25d):
-            raise ValueError(f"ct_25d must be floating point, got {ct_25d.dtype}")
-        if not torch.isfinite(ct_25d).all().item():
-            raise ValueError("ct_25d must contain only finite values")
-        minimum = float(ct_25d.min().item())
-        maximum = float(ct_25d.max().item())
+        if not torch.is_floating_point(ct):
+            raise ValueError(f"roi_25d ct must be floating point, got {ct.dtype}")
+        if not torch.isfinite(ct).all().item():
+            raise ValueError("roi_25d ct must contain only finite values")
+        minimum = float(ct.min().item())
+        maximum = float(ct.max().item())
         if minimum < 0.0 or maximum > 1.0:
             raise ValueError(
-                "ct_25d must follow the preprocessing range [0, 1], "
+                "roi_25d ct must follow the preprocessing range [0, 1], "
                 f"got [{minimum}, {maximum}]"
             )
-        if ct_25d.device != self.image_mean.device:
+        if ct.device != self.image_mean.device:
             raise ValueError(
-                "ct_25d and CTEncoder must be on the same device, got "
-                f"{ct_25d.device} and {self.image_mean.device}"
+                "ct and CTEncoder2D must be on the same device, got "
+                f"{ct.device} and {self.image_mean.device}"
             )
-        return ct_25d.ndim == 3
+        return ct.ndim == 3
 
 
 def _run_smoke_test() -> None:
     """Exercise the encoder without downloading pretrained weights."""
     torch.manual_seed(42)
-    model = CTEncoder(pretrained=False)
+    model = CTEncoder2D(pretrained=False)
     model.eval()
 
     batch = torch.rand(2, 3, 224, 224, dtype=torch.float32)
@@ -187,12 +183,16 @@ def _run_smoke_test() -> None:
     assert torch.isfinite(batch_embedding).all()
     assert torch.isfinite(single_embedding).all()
 
-    frozen_model = CTEncoder(pretrained=False, freeze_backbone=True)
+    frozen_model = CTEncoder2D(pretrained=False, freeze_backbone=True)
     frozen_model.train()
     assert frozen_model.backbone_frozen
     assert not frozen_model.backbone.training
-    assert not any(parameter.requires_grad for parameter in frozen_model.backbone.parameters())
-    assert all(parameter.requires_grad for parameter in frozen_model.projection.parameters())
+    assert not any(
+        parameter.requires_grad for parameter in frozen_model.backbone.parameters()
+    )
+    assert all(
+        parameter.requires_grad for parameter in frozen_model.projection.parameters()
+    )
 
     invalid_channels = torch.rand(2, 5, 224, 224)
     try:
