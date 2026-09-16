@@ -1,176 +1,143 @@
 # Huashan multimodal forecasting pipeline
 
-This project predicts ten future biochemical markers from an L3-centered CT,
-baseline biochemistry, demographics, and a future query time. Train/validation/test
-assignment is patient-level, while each Dataset item is one follow-up observation.
+This repository trains one longitudinal biochemistry forecasting model with a
+configurable CT representation. The baseline remains `roi_25d + resnet18_2d`;
+`roi_3d + conv3d` uses the same Dataset, fusion head, training loop, evaluation,
+loss, metrics, and patient split.
 
-## Fixed model contract
+## CT preparation stages
 
-- Biomarker order: `HBA1C, TG, CHO, HDL, LDL, ALB, BUN, UA, CRE, CysC`.
-- CT model input: `float32 [B,3,H,W]`, values in `[0,1]`, `H,W >= 32`.
-- Default CT input: three L3-centered axial slices at `224 x 224`.
-- Biochemistry and masks: `[B,10]`; `1=observed`, `0=missing`.
-- Demographics: `[normalized_age, sex_code]`, where female=0 and male=1.
-- Time: `[B,1]` in years (`t_days / 365.25`).
-- Prediction: ten standardized future biomarkers.
+All stages update one wide `ct_manifest.csv` with one row per patient. Run only a
+small representative sample (`--limit 3` to `--limit 5`) before cohort-scale
+preprocessing.
 
-The current end-to-end model intentionally supports exactly three CT slices. The CT
-preparation script may generate other odd slice counts for future encoders, but those
-arrays are rejected by the present training pipeline.
+```text
+DICOM directory or NIfTI
+  -> full_ct             canonical complete-coverage LPS NIfTI, HU not windowed
+  -> vertebral masks     L2/L3/L4 TotalSegmentator outputs
+  -> l2_l4_roi           geometry-preserving lumbar slab and L3 location
+  -> roi_25d             fixed [C,H,W] baseline tensor
+  -> roi_3d              fixed [D,H,W] physical crop, Dataset adds channel
 
-## Environment
-
-Create an isolated Python environment and install a PyTorch build compatible with the
-training machine. Then install the project dependencies:
-
-```bash
-python -m pip install -r requirements.txt
+full_ct -> full_3d       variable-depth preprocessing boundary, not trainable
 ```
 
-CT preparation additionally requires:
-
-- `dcm2niix` on `PATH` for DICOM conversion;
-- the `totalsegmentator` or `TotalSegmentator` CLI on `PATH`.
-
-The exact PyTorch, CUDA, TotalSegmentator, and driver versions used for a formal
-experiment should be captured with the resulting checkpoint/run artifacts.
-
-## 1. CT preparation
-
-Start with a small `--limit` and inspect the manifest before processing the cohort.
+Example commands:
 
 ```bash
-python CT_preparation/convert_dicom.py \
+python -m ct_preparation.prepare_full_ct \
   --input multidataset/huashan_cleaned.xlsx \
-  --sheet baseline \
-  --output-root /mnt/data/huashan_ct_processed \
-  --manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --relative-paths \
-  --limit 3
+  --output-root /data/huashan_ct --relative-paths --limit 3
 
-python CT_preparation/segment_vertebrae.py \
-  --manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --output-root /mnt/data/huashan_ct_processed \
-  --relative-paths \
-  --limit 3
+python -m ct_preparation.segment_vertebrae \
+  --manifest /data/huashan_ct/ct_manifest.csv \
+  --output-root /data/huashan_ct --relative-paths --limit 3
 
-python CT_preparation/extract_l2_l4_roi.py \
-  --manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --output-root /mnt/data/huashan_ct_processed \
-  --target-spacing 1.5 1.5 2.0 \
-  --z-margin-mm 20 \
-  --relative-paths \
-  --limit 3
+python -m ct_preparation.extract_l2_l4_roi \
+  --manifest /data/huashan_ct/ct_manifest.csv \
+  --output-root /data/huashan_ct --relative-paths --limit 3
 
-python CT_preparation/build_25d.py \
-  --manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --output-root /mnt/data/huashan_ct_processed \
-  --num-slices 3 \
-  --image-size 224 \
-  --window-min -200 \
-  --window-max 300 \
-  --save-preview \
-  --relative-paths \
-  --limit 3
+python -m ct_preparation.build_roi_25d \
+  --manifest /data/huashan_ct/ct_manifest.csv \
+  --output-root /data/huashan_ct --relative-paths --limit 3
+
+python -m ct_preparation.build_roi_3d \
+  --manifest /data/huashan_ct/ct_manifest.csv \
+  --output-root /data/huashan_ct --relative-paths --limit 3
 ```
 
-Remove `--limit` only after the small run passes numerical and visual QC. Failures
-remain in `ct_manifest.csv`; patients are never silently deleted or reassigned.
+`roi_3d` defaults to spacing `(x,y,z)=(1.5,1.5,2.0)` mm and stored shape
+`(d,h,w)=(64,160,160)`. It resamples to physical spacing, then crops a fixed
+field of view around the L3 physical centroid. Missing extent is padded with
+`-1024 HU` before applying the `[-200,300] HU` window. It does not resize a
+variable anatomical field of view into a fixed pixel matrix. Each processed
+patient receives axial/coronal/sagittal preview images for QA.
 
-## 2. Dataset and normalization
+Image metadata always uses `(x,y,z)` suffixes. NumPy arrays use `(d,h,w)`;
+`roi_25d` uses `(c,h,w)`.
 
-Fit normalization on the final CT-eligible train cohort and run the Dataset checks:
+## Wide manifest and migration
 
-```bash
-python multidataset/huashan_dataset.py \
-  --input multidataset/huashan_cleaned.xlsx \
-  --ct-manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --split-file multidataset/patient_split.csv \
-  --stats-file multidataset/normalization.json \
-  --fit-stats \
-  --smoke-test
-```
+Canonical fields are grouped by stage:
 
-New normalization files contain hashes of the split, CT manifest, and effective train
-patient cohort. Legacy JSON files are accepted with a warning but should not be used
-for a formal experiment.
+- source and schema: `manifest_schema_version`, `patient_id`, `source_ct_path`;
+- ingestion: `full_ct_*`, selected-series UID/description and geometry;
+- segmentation: `l2_mask_path`, `l3_mask_path`, `l4_mask_path`, status/message;
+- lumbar ROI: `l2_l4_roi_*`, `l3_center_index`, `l3_centroid_*_mm`;
+- representations: `roi_25d_*`, `roi_3d_*`, and `full_3d_*`.
 
-For a manifest containing relative `npy_25d_path` values, pass
-`--ct-root /mnt/data/huashan_ct_processed`. Relative paths otherwise resolve against
-the manifest directory.
+Readers map legacy fields (`nifti_path`, `conversion_status`, `roi_path`,
+`roi_status`, `L3_center_slice`, `npy_25d_path`, `build_25d_status`) in memory.
+Existing 2.5D arrays do not need regeneration. New writes use canonical names and
+preserve unknown manifest columns.
 
-## 3. Read-only preflight
+## Configuration and common entry points
+
+CT contracts are version controlled in `configs/ct/`. Experiment files in
+`configs/experiments/` reference one CT contract. Incompatible representation,
+encoder, shape, or trainability combinations fail before data loading.
 
 ```bash
 python preflight.py \
   --input multidataset/huashan_cleaned.xlsx \
-  --ct-manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --split-file multidataset/patient_split.csv \
-  --stats-file multidataset/normalization.json \
-  --report runs/preflight.json
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --ct-config configs/ct/roi_3d.yaml
+
+python train.py \
+  --input multidataset/huashan_cleaned.xlsx \
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --config configs/experiments/ct_roi3d_seed42.yaml
+
+python evaluate.py \
+  --input multidataset/huashan_cleaned.xlsx \
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --checkpoint runs/huashan/best.pt
 ```
 
-Preflight checks patient leakage, CT eligibility by split, every CT array's shape,
-dtype/range, CysC coverage, normalization provenance, and upstream
-`comparison_status`. It reports external CT tools but does not require them for model
-training.
+Training saves `resolved_config.json`; checkpoints store representation, encoder,
+expected shape, and preprocessing version. Evaluation loads this checkpoint
+metadata before constructing its Dataset. An optional `--ct-config` is only an
+assertion and must match the checkpoint.
 
-## 4. Integration smoke test
+Old checkpoints without CT metadata are interpreted as:
 
-The integration test creates temporary synthetic arrays and performs a real forward,
-backward, optimizer step, and checkpoint reload without downloading pretrained
-weights:
+```text
+roi_25d + resnet18_2d + [3,224,224] + roi25d-v1
+```
+
+The Dataset returns `ct`, `ct_path`, and `ct_representation`. Stored `roi_3d`
+`[D,H,W]` becomes sample `[1,D,H,W]` and batch `[B,1,D,H,W]`. The baseline is
+sample `[3,H,W]` and batch `[B,3,H,W]`.
+
+## Fair comparison and provenance
+
+Normalization metadata records two distinct hashes:
+
+- `cohort_signature`: longitudinal input hash, split file, and effective train
+  patient/observation set;
+- `representation_signature`: selected representation/version and only its
+  patient/path/status records.
+
+Changes to unrelated columns in the wide manifest therefore do not invalidate
+biochemical normalization. A fair 2.5D/3D comparison must use identical split
+assignments and the same ordered patient intersection for train, validation, and
+test. Repair representation failures or evaluate both models on the common
+intersection; never tune on the test set.
+
+## Tests
+
+Tests use synthetic arrays/images, do not download pretrained weights, and do not
+need patient data:
 
 ```bash
+python -m unittest discover -s tests -v
 python pipeline_smoke_test.py
 ```
 
-## 5. Training
-
-The default baseline loads ImageNet ResNet18 weights, freezes the CT backbone, uses
-patient-balanced sampling, and fits normalization on the final CT-eligible train
-cohort:
-
-```bash
-python train.py \
-  --input multidataset/huashan_cleaned.xlsx \
-  --ct-manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --split-file multidataset/patient_split.csv \
-  --stats-file multidataset/normalization.json \
-  --output-dir runs/baseline \
-  --batch-size 16 \
-  --epochs 50 \
-  --learning-rate 1e-3 \
-  --patience 10 \
-  --device auto
-```
-
-Use `--finetune-ct-backbone` only for a deliberate fine-tuning experiment. Use
-`--no-pretrained` for offline/debug runs, `--amp` for CUDA mixed precision, and
-`--resume runs/baseline/last.pt` to continue a compatible run. `--reuse-stats` is
-available only when the stored cohort metadata matches the current inputs.
-
-Training writes `best.pt`, `last.pt`, `history.json`, `test_metrics.json`, and
-`test_predictions.csv` into the output directory.
-
-## 6. Evaluation
-
-```bash
-python evaluate.py \
-  --input multidataset/huashan_cleaned.xlsx \
-  --ct-manifest /mnt/data/huashan_ct_processed/ct_manifest.csv \
-  --checkpoint runs/baseline/best.pt \
-  --split test \
-  --predictions runs/baseline/test_predictions_reproduced.csv \
-  --metrics runs/baseline/test_metrics_reproduced.json
-```
-
-Metrics include masked Huber loss and per-biomarker standardized/clinical-unit MAE
-and RMSE. CysC is evaluated only where its target mask equals one.
-
-## Scope
-
-The current version deliberately excludes cross-validation, attention models, CT
-augmentation, segmentation fine-tuning, distributed training, experiment tracking,
-and target-free prospective clinical inference. Those should be added only after the
-baseline pipeline is validated on real CT data.
+Before a real cohort run, inspect manifest/numeric metadata, all three preview
+planes, crop boundaries and padding, then run preflight and one-batch
+forward/backward. Raw CT, generated arrays, weights, and run directories must not
+be committed.
