@@ -89,6 +89,23 @@ class ManifestAndConfigTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "l3_center_index"], 7)
         self.assertEqual(result.loc[0, "site_note"], "preserve me")
 
+    def test_canonical_manifest_accepts_incremental_numeric_metadata(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "patient_id": pd.Series(["10001857"], dtype="string"),
+                "candidate_series_count": pd.Series([""], dtype="string"),
+            }
+        )
+        manifest = canonicalize_manifest(frame)
+
+        manifest.loc[0, "full_ct_shape_x"] = 512
+        manifest.loc[0, "full_ct_spacing_x"] = 0.7421875
+        manifest.loc[0, "candidate_series_count"] = 1
+
+        self.assertEqual(manifest.loc[0, "full_ct_shape_x"], 512)
+        self.assertEqual(manifest.loc[0, "full_ct_spacing_x"], 0.7421875)
+        self.assertEqual(manifest.loc[0, "candidate_series_count"], 1)
+
     def test_incompatible_encoder_and_full_3d_fail_early(self) -> None:
         with self.assertRaisesRegex(ValueError, "incompatible"):
             resolve_ct_input_spec(

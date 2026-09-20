@@ -250,7 +250,11 @@ def canonicalize_manifest(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"CT manifest has duplicate patient_id: {duplicate!r}")
     for column in CANONICAL_COLUMNS:
         if column not in manifest.columns:
-            manifest[column] = ""
+            manifest[column] = pd.Series("", index=manifest.index, dtype=object)
+    # Preparation stages update both canonical fields and preserved extension
+    # fields incrementally. CSV loading can infer either kind as pandas' strict
+    # string dtype, which then rejects later integer/float geometry metadata.
+    manifest = manifest.astype(object)
     manifest["manifest_schema_version"] = manifest["manifest_schema_version"].replace(
         "", MANIFEST_SCHEMA_VERSION
     )
