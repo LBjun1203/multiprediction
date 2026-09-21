@@ -11,6 +11,7 @@ import torch
 
 from multidataset.huashan_dataset import ALL_BIOMARKERS
 from pretraining.contrastive_model import CTBioContrastiveModel
+from ct_preparation.manifest import resolve_ct_input_spec
 
 CHECKPOINT_TYPE = "ct_bio_contrastive_pretraining"
 CHECKPOINT_VERSION = 1
@@ -141,3 +142,53 @@ def load_checkpoint(
     if restore_rng:
         restore_rng_state(checkpoint["rng_state"])
     return model, checkpoint
+
+
+def load_ct_encoder_for_forecasting(
+    forecast_model: torch.nn.Module,
+    path: str | Path,
+    *,
+    policy: str = "frozen",
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    """Strictly transfer only a compatible CT encoder into a new forecast model."""
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Pretraining checkpoint must contain a mapping")
+    validate_checkpoint(checkpoint)
+    if not hasattr(forecast_model, "ct_encoder") or not hasattr(
+        forecast_model, "ct_input_spec"
+    ):
+        raise ValueError("Forecast model does not expose the CT encoder contract")
+    checkpoint_spec = resolve_ct_input_spec(checkpoint["ct_config"])
+    if checkpoint_spec != forecast_model.ct_input_spec:
+        raise ValueError(
+            "Pretraining and forecast CT contracts differ: "
+            f"pretraining={checkpoint_spec}, forecast={forecast_model.ct_input_spec}"
+        )
+    pretrain_feature_dim = int(checkpoint["model_config"]["ct_feature_dim"])
+    forecast_feature_dim = int(forecast_model.model_config["ct_embedding_dim"])
+    if pretrain_feature_dim != forecast_feature_dim:
+        raise ValueError(
+            "Pretraining CT feature dimension differs from forecast CT embedding "
+            f"dimension: {pretrain_feature_dim} != {forecast_feature_dim}"
+        )
+    forecast_width = int(forecast_model.model_config.get("ct_encoder_base_width", 64))
+    pretrain_width = int(checkpoint["model_config"].get("ct_encoder_base_width", 64))
+    if forecast_width != pretrain_width:
+        raise ValueError(
+            f"Pretraining and forecast CT base widths differ: {pretrain_width} != {forecast_width}"
+        )
+    forecast_model.ct_encoder.load_state_dict(
+        checkpoint["ct_encoder_state"], strict=True
+    )
+    forecast_model.set_ct_transfer_policy(policy)
+    return {
+        "checkpoint_type": checkpoint["checkpoint_type"],
+        "checkpoint_version": checkpoint["checkpoint_version"],
+        "ct_config": checkpoint_spec.to_dict(),
+        "ct_feature_dim": pretrain_feature_dim,
+        "ct_encoder_base_width": pretrain_width,
+        "transfer_policy": policy,
+        "source_checkpoint": str(Path(path).resolve()),
+    }

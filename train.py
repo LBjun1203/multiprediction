@@ -38,6 +38,10 @@ from multidataset.huashan_dataset import (
     normalization_values_equal,
 )
 from multimodal_model import HuashanForecastModel
+from pretraining.checkpoint import (
+    load_ct_encoder_for_forecasting,
+    validate_checkpoint as validate_pretraining_checkpoint,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +85,21 @@ def parse_args() -> argparse.Namespace:
         help="Reuse compatible normalization stats instead of fitting the final CT-eligible train cohort",
     )
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--ct-pretrained-checkpoint",
+        type=Path,
+        help="Start a new run by loading only a compatible pretrained CT encoder",
+    )
+    parser.add_argument(
+        "--ct-transfer-policy",
+        choices=("frozen", "last_stage", "full"),
+        default="frozen",
+    )
+    parser.add_argument(
+        "--ct-learning-rate",
+        type=float,
+        help="Learning rate for trainable transferred CT parameters (default: 0.1x)",
+    )
     return parser.parse_args()
 
 
@@ -186,6 +205,11 @@ def save_checkpoint(
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.resume is not None and args.ct_pretrained_checkpoint is not None:
+        raise ValueError(
+            "--resume and --ct-pretrained-checkpoint are mutually exclusive: resume "
+            "restores a full forecast run, while transfer starts a new run"
+        )
     if args.batch_size <= 0 or args.epochs <= 0:
         raise ValueError("--batch-size and --epochs must be positive")
     if args.learning_rate <= 0 or args.weight_decay < 0:
@@ -198,6 +222,42 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--image-size must be at least 32")
     if args.grad_clip is not None and args.grad_clip <= 0:
         raise ValueError("--grad-clip must be positive")
+    if args.ct_learning_rate is not None and args.ct_learning_rate <= 0:
+        raise ValueError("--ct-learning-rate must be positive")
+
+
+def build_new_run_optimizer(
+    model: HuashanForecastModel,
+    args: argparse.Namespace,
+    *,
+    transferred: bool,
+) -> AdamW:
+    if not transferred:
+        return AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+    ct_parameters = [
+        parameter for parameter in model.ct_encoder.parameters() if parameter.requires_grad
+    ]
+    ct_parameter_ids = {id(parameter) for parameter in ct_parameters}
+    new_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in ct_parameter_ids
+    ]
+    groups: list[dict[str, Any]] = [
+        {"params": new_parameters, "lr": args.learning_rate}
+    ]
+    if ct_parameters:
+        groups.append(
+            {
+                "params": ct_parameters,
+                "lr": args.ct_learning_rate or args.learning_rate * 0.1,
+            }
+        )
+    return AdamW(groups, weight_decay=args.weight_decay)
 
 
 def main() -> None:
@@ -319,15 +379,42 @@ def main() -> None:
                 "Resume checkpoint normalization differs from the current cohort"
             )
     else:
+        transfer_checkpoint: dict[str, Any] | None = None
+        ct_encoder_base_width = 64
+        if args.ct_pretrained_checkpoint is not None:
+            transfer_checkpoint = torch.load(
+                args.ct_pretrained_checkpoint,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if not isinstance(transfer_checkpoint, dict):
+                raise ValueError("Pretraining checkpoint must contain a mapping")
+            validate_pretraining_checkpoint(transfer_checkpoint)
+            ct_encoder_base_width = int(
+                transfer_checkpoint["model_config"].get("ct_encoder_base_width", 64)
+            )
         model = HuashanForecastModel(
-            pretrained_ct=not args.no_pretrained,
+            pretrained_ct=(
+                False
+                if args.ct_pretrained_checkpoint is not None
+                else not args.no_pretrained
+            ),
             freeze_ct_backbone=not args.finetune_ct_backbone,
+            ct_encoder_base_width=ct_encoder_base_width,
             ct_config=ct_spec,
         ).to(device)
-        optimizer = AdamW(
-            (parameter for parameter in model.parameters() if parameter.requires_grad),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
+        if args.ct_pretrained_checkpoint is not None:
+            transfer_provenance = load_ct_encoder_for_forecasting(
+                model,
+                args.ct_pretrained_checkpoint,
+                policy=args.ct_transfer_policy,
+                map_location=device,
+            )
+            model.model_config["ct_pretraining_transfer"] = transfer_provenance
+        optimizer = build_new_run_optimizer(
+            model,
+            args,
+            transferred=args.ct_pretrained_checkpoint is not None,
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -233,19 +233,24 @@ def _load_pretraining_split(path: str | Path) -> pd.DataFrame:
     return split
 
 
-def _downstream_forbidden_ids(path: str | Path | None) -> set[str]:
+def _downstream_split_ids(path: str | Path | None) -> dict[str, set[str]]:
     if path is None:
-        return set()
+        return {"train": set(), "val": set(), "test": set()}
     split = pd.read_csv(path, dtype={"patient_id": "string", "split": "string"})
     missing = sorted({"patient_id", "split"} - set(split.columns))
     if missing:
         raise ValueError(f"Downstream split is missing columns: {missing}")
     split["patient_id"] = split["patient_id"].map(clean_patient_id)
     split["split"] = split["split"].astype(str).str.strip().str.lower()
+    if split["patient_id"].duplicated().any():
+        raise ValueError("Downstream split has duplicate patient_id")
     invalid = ~split["split"].isin({"train", "val", "test"})
     if invalid.any():
         raise ValueError("Downstream split contains an invalid split value")
-    return set(split.loc[split["split"].isin({"val", "test"}), "patient_id"])
+    return {
+        name: set(split.loc[split["split"].eq(name), "patient_id"])
+        for name in ("train", "val", "test")
+    }
 
 
 def _sha256_payload(value: Any) -> str:
@@ -279,7 +284,8 @@ def build_paired_datasets(
             f"unknown={sorted(split_ids - pair_ids)[:10]}"
         )
 
-    forbidden = _downstream_forbidden_ids(downstream_split_path)
+    downstream_ids = _downstream_split_ids(downstream_split_path)
+    forbidden = downstream_ids["val"] | downstream_ids["test"]
     overlap_before_exclusion = pair_ids & forbidden
     pairs = pairs.loc[~pairs["patient_id"].isin(forbidden)].copy()
     split = split.loc[~split["patient_id"].isin(forbidden)].copy()
@@ -338,6 +344,10 @@ def build_paired_datasets(
         "unique_patients": len(pair_ids),
         "duplicate_patient_count": 0,
         "excluded_downstream_val_test_patients": len(overlap_before_exclusion),
+        "input_overlap_with_downstream": {
+            name: len(pair_ids & patient_ids)
+            for name, patient_ids in downstream_ids.items()
+        },
         "ct_eligible_pairs": len(merged),
         "ct_eligibility_failures": len(pairs) - len(merged),
         "train_pairs": len(frames["train"]),

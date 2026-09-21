@@ -119,6 +119,7 @@ class ResNet18Encoder3D(nn.Module):
             nn.GELU(),
         )
         self._backbone_frozen = False
+        self._fully_frozen = False
         self._initialize_parameters()
         self.set_backbone_trainable(not freeze_backbone)
 
@@ -151,6 +152,7 @@ class ResNet18Encoder3D(nn.Module):
         if not isinstance(trainable, bool):
             raise ValueError("trainable must be bool")
         self._backbone_frozen = not trainable
+        self._fully_frozen = False
         for module in self._backbone_modules():
             for parameter in module.parameters():
                 parameter.requires_grad_(trainable)
@@ -163,6 +165,9 @@ class ResNet18Encoder3D(nn.Module):
                 "CT transfer policy must be 'frozen', 'last_stage', or 'full'"
             )
         self.set_backbone_trainable(policy == "full")
+        for parameter in self.projection.parameters():
+            parameter.requires_grad_(policy != "frozen")
+        self._fully_frozen = policy == "frozen"
         if policy == "last_stage":
             for parameter in self.layer4.parameters():
                 parameter.requires_grad_(True)
@@ -178,6 +183,8 @@ class ResNet18Encoder3D(nn.Module):
         ]
         for module in frozen_modules:
             module.eval()
+        if self._fully_frozen:
+            self.projection.eval()
         return self
 
     def forward(self, ct: torch.Tensor) -> torch.Tensor:

@@ -99,6 +99,20 @@ class HuashanForecastModel(nn.Module):
         self.ct_encoder.set_backbone_trainable(trainable)
         self.model_config["freeze_ct_backbone"] = not trainable
 
+    def set_ct_transfer_policy(self, policy: str) -> None:
+        if not hasattr(self.ct_encoder, "set_transfer_policy"):
+            if policy != "frozen":
+                raise ValueError(
+                    f"CT encoder {self.ct_input_spec.encoder!r} does not support "
+                    f"transfer policy {policy!r}"
+                )
+            for parameter in self.ct_encoder.parameters():
+                parameter.requires_grad_(False)
+            self.ct_encoder.eval()
+        else:
+            self.ct_encoder.set_transfer_policy(policy)
+        self.model_config["ct_transfer_policy"] = policy
+
     def forward(
         self,
         batch: Mapping[str, torch.Tensor],

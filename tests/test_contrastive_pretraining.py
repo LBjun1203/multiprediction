@@ -7,7 +7,13 @@ from pathlib import Path
 import torch
 
 from ct_preparation.manifest import CTInputSpec
-from pretraining.checkpoint import build_checkpoint, load_checkpoint, save_checkpoint
+from multimodal_model import HuashanForecastModel
+from pretraining.checkpoint import (
+    build_checkpoint,
+    load_checkpoint,
+    load_ct_encoder_for_forecasting,
+    save_checkpoint,
+)
 from pretraining.contrastive_model import CTBioContrastiveModel
 from pretraining.losses import retrieval_recalls, symmetric_info_nce
 
@@ -79,6 +85,91 @@ class ContrastivePretrainingTests(unittest.TestCase):
             self.assertEqual(loaded["checkpoint_type"], "ct_bio_contrastive_pretraining")
             for original, actual in zip(model.parameters(), restored.parameters()):
                 torch.testing.assert_close(actual, original, rtol=0, atol=0)
+
+    def test_forecast_transfer_loads_only_ct_encoder(self) -> None:
+        torch.manual_seed(11)
+        pretraining_model = self.make_model()
+        optimizer = torch.optim.AdamW(pretraining_model.parameters(), lr=1e-3)
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "pretrain.pt"
+            save_checkpoint(
+                path,
+                build_checkpoint(
+                    pretraining_model,
+                    optimizer,
+                    scaler,
+                    epoch=1,
+                    best_validation_metric=1.0,
+                    normalization_stats={"source": "synthetic"},
+                    split_provenance={"source": "synthetic"},
+                    history=[],
+                ),
+            )
+            forecast = HuashanForecastModel(
+                ct_embedding_dim=12,
+                bio_embedding_dim=12,
+                pretrained_ct=False,
+                freeze_ct_backbone=False,
+                ct_encoder_base_width=2,
+                ct_config=pretraining_model.ct_input_spec,
+            )
+            bio_before = {
+                key: value.detach().clone()
+                for key, value in forecast.bio_encoder.state_dict().items()
+            }
+            fusion_before = {
+                key: value.detach().clone()
+                for key, value in forecast.fusion_head.state_dict().items()
+            }
+            provenance = load_ct_encoder_for_forecasting(
+                forecast, path, policy="frozen"
+            )
+            self.assertEqual(provenance["transfer_policy"], "frozen")
+            for key, value in pretraining_model.ct_encoder.state_dict().items():
+                torch.testing.assert_close(
+                    forecast.ct_encoder.state_dict()[key], value, rtol=0, atol=0
+                )
+            for key, value in bio_before.items():
+                torch.testing.assert_close(
+                    forecast.bio_encoder.state_dict()[key], value, rtol=0, atol=0
+                )
+            for key, value in fusion_before.items():
+                torch.testing.assert_close(
+                    forecast.fusion_head.state_dict()[key], value, rtol=0, atol=0
+                )
+            self.assertFalse(
+                any(parameter.requires_grad for parameter in forecast.ct_encoder.parameters())
+            )
+            forecast_batch = {
+                "ct": torch.rand(2, 1, 8, 16, 16),
+                "bio_base": torch.randn(2, 10),
+                "base_mask": torch.ones(2, 10),
+                "demographics": torch.randn(2, 2),
+                "time": torch.rand(2, 1),
+            }
+            prediction = forecast(forecast_batch)
+            self.assertEqual(tuple(prediction.shape), (2, 10))
+            prediction.square().mean().backward()
+            self.assertTrue(
+                any(
+                    parameter.grad is not None
+                    for parameter in forecast.fusion_head.parameters()
+                )
+            )
+            checkpoint_keys = torch.load(path, weights_only=False).keys()
+            self.assertIn("ct_projector_state", checkpoint_keys)
+            self.assertNotIn("ct_projector", dict(forecast.named_modules()))
+
+            incompatible = HuashanForecastModel(
+                ct_embedding_dim=13,
+                bio_embedding_dim=12,
+                pretrained_ct=False,
+                ct_encoder_base_width=2,
+                ct_config=pretraining_model.ct_input_spec,
+            )
+            with self.assertRaisesRegex(ValueError, "feature dimension"):
+                load_ct_encoder_for_forecasting(incompatible, path)
 
 
 if __name__ == "__main__":
