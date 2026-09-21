@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ct_modal.config import load_experiment_config
-from evaluate import move_batch_to_device, resolve_device
+from evaluate import resolve_device
 from pretraining.checkpoint import (
     build_checkpoint,
     load_checkpoint,
@@ -131,7 +131,14 @@ def run_epoch(
     pair_count = 0
     metric_sums: dict[str, float] = {}
     for raw_batch in loader:
-        batch = move_batch_to_device(raw_batch, device)
+        batch = {
+            key: (
+                value.to(device, non_blocking=device.type == "cuda")
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in raw_batch.items()
+        }
         batch_size = int(batch["ct"].shape[0])
         if batch_size < 2:
             raise ValueError("InfoNCE loader produced a batch smaller than 2")
