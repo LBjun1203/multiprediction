@@ -10,11 +10,15 @@ import numpy as np
 import torch
 
 from multidataset.huashan_dataset import ALL_BIOMARKERS
-from pretraining.contrastive_model import CTBioContrastiveModel
+from pretraining.contrastive_model import (
+    CTBioContrastiveModel,
+    CTBiochemistryRegressionModel,
+)
 from ct_preparation.manifest import resolve_ct_input_spec
 
 CHECKPOINT_TYPE = "ct_bio_contrastive_pretraining"
 CHECKPOINT_VERSION = 1
+REGRESSION_CHECKPOINT_TYPE = "ct_bio_regression_pretraining"
 REQUIRED_KEYS = {
     "checkpoint_type",
     "checkpoint_version",
@@ -35,6 +39,12 @@ REQUIRED_KEYS = {
     "history",
     "rng_state",
 }
+REGRESSION_REQUIRED_KEYS = REQUIRED_KEYS - {
+    "bio_encoder_state",
+    "ct_projector_state",
+    "bio_projector_state",
+    "temperature_state",
+} | {"regression_head_state"}
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -104,8 +114,32 @@ def validate_checkpoint(checkpoint: dict[str, Any]) -> None:
         raise ValueError("Pretraining checkpoint biomarker order is incompatible")
 
 
+def validate_regression_checkpoint(checkpoint: dict[str, Any]) -> None:
+    missing = sorted(REGRESSION_REQUIRED_KEYS - set(checkpoint))
+    if missing:
+        raise ValueError(f"Regression pretraining checkpoint is missing keys: {missing}")
+    if checkpoint["checkpoint_type"] != REGRESSION_CHECKPOINT_TYPE:
+        raise ValueError(
+            f"Expected checkpoint_type={REGRESSION_CHECKPOINT_TYPE!r}, got "
+            f"{checkpoint['checkpoint_type']!r}"
+        )
+    if checkpoint["checkpoint_version"] != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Unsupported regression checkpoint version: {checkpoint['checkpoint_version']}"
+        )
+    if checkpoint["biomarker_order"] != list(ALL_BIOMARKERS):
+        raise ValueError("Regression checkpoint biomarker order is incompatible")
+
+
+def validate_transfer_checkpoint(checkpoint: dict[str, Any]) -> None:
+    if checkpoint.get("checkpoint_type") == REGRESSION_CHECKPOINT_TYPE:
+        validate_regression_checkpoint(checkpoint)
+    else:
+        validate_checkpoint(checkpoint)
+
+
 def save_checkpoint(path: str | Path, checkpoint: dict[str, Any]) -> None:
-    validate_checkpoint(checkpoint)
+    validate_transfer_checkpoint(checkpoint)
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
@@ -144,6 +178,57 @@ def load_checkpoint(
     return model, checkpoint
 
 
+def build_regression_checkpoint(
+    model: CTBiochemistryRegressionModel,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    *,
+    epoch: int,
+    best_validation_metric: float,
+    normalization_stats: dict[str, Any],
+    split_provenance: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "checkpoint_type": REGRESSION_CHECKPOINT_TYPE,
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "ct_encoder_state": model.ct_encoder.state_dict(),
+        "regression_head_state": model.regression_head.state_dict(),
+        "model_config": dict(model.model_config),
+        "ct_config": model.ct_input_spec.to_dict(),
+        "biomarker_order": list(ALL_BIOMARKERS),
+        "normalization_stats": normalization_stats,
+        "pretraining_split_provenance": split_provenance,
+        "optimizer_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "epoch": int(epoch),
+        "best_validation_metric": float(best_validation_metric),
+        "history": list(history),
+        "rng_state": capture_rng_state(),
+    }
+
+
+def load_regression_checkpoint(
+    path: str | Path,
+    *,
+    map_location: str | torch.device = "cpu",
+    restore_rng: bool = False,
+) -> tuple[CTBiochemistryRegressionModel, dict[str, Any]]:
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Regression pretraining checkpoint must contain a mapping")
+    validate_regression_checkpoint(checkpoint)
+    model = CTBiochemistryRegressionModel.from_config(checkpoint["model_config"])
+    model.ct_encoder.load_state_dict(checkpoint["ct_encoder_state"], strict=True)
+    model.regression_head.load_state_dict(
+        checkpoint["regression_head_state"], strict=True
+    )
+    model.to(map_location)
+    if restore_rng:
+        restore_rng_state(checkpoint["rng_state"])
+    return model, checkpoint
+
+
 def load_ct_encoder_for_forecasting(
     forecast_model: torch.nn.Module,
     path: str | Path,
@@ -155,7 +240,7 @@ def load_ct_encoder_for_forecasting(
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError("Pretraining checkpoint must contain a mapping")
-    validate_checkpoint(checkpoint)
+    validate_transfer_checkpoint(checkpoint)
     if not hasattr(forecast_model, "ct_encoder") or not hasattr(
         forecast_model, "ct_input_spec"
     ):

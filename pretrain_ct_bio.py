@@ -17,11 +17,20 @@ from ct_modal.config import load_experiment_config
 from evaluate import resolve_device
 from pretraining.checkpoint import (
     build_checkpoint,
+    build_regression_checkpoint,
     load_checkpoint,
+    load_regression_checkpoint,
     save_checkpoint,
 )
-from pretraining.contrastive_model import CTBioContrastiveModel
-from pretraining.losses import retrieval_recalls, symmetric_info_nce
+from pretraining.contrastive_model import (
+    CTBioContrastiveModel,
+    CTBiochemistryRegressionModel,
+)
+from pretraining.losses import (
+    masked_huber_regression_loss,
+    retrieval_recalls,
+    symmetric_info_nce,
+)
 from pretraining.paired_dataset import build_paired_datasets
 
 
@@ -51,10 +60,12 @@ def seed_everything(seed: int) -> None:
 
 
 def model_config_from_values(ct_spec: Any, values: dict[str, Any]) -> dict[str, Any]:
-    keys = (
+    common_keys = (
         "ct_feature_dim",
         "ct_encoder_base_width",
         "ct_dropout",
+    )
+    contrastive_keys = (
         "bio_hidden_dim",
         "bio_feature_dim",
         "bio_dropout",
@@ -65,6 +76,7 @@ def model_config_from_values(ct_spec: Any, values: dict[str, Any]) -> dict[str, 
         "min_temperature",
         "max_temperature",
     )
+    keys = common_keys + (contrastive_keys if values["objective"] == "contrastive" else ())
     missing = sorted(set(keys) - set(values))
     if missing:
         raise ValueError(f"Pretraining config is missing model keys: {missing}")
@@ -72,23 +84,23 @@ def model_config_from_values(ct_spec: Any, values: dict[str, Any]) -> dict[str, 
 
 
 def validate_values(values: dict[str, Any]) -> None:
-    if values.get("objective") != "contrastive":
-        raise ValueError(
-            "This entry point currently trains objective='contrastive'; the regression "
-            "control model/loss are available but require a separately approved run config"
-        )
+    if values.get("objective") not in {"contrastive", "regression"}:
+        raise ValueError("objective must be 'contrastive' or 'regression'")
     positive = (
         "batch_size",
         "epochs",
         "ct_learning_rate",
-        "bio_learning_rate",
         "head_learning_rate",
         "gradient_clip",
     )
     for key in positive:
         if float(values.get(key, 0)) <= 0:
             raise ValueError(f"Pretraining config {key} must be positive")
-    if int(values.get("batch_size", 0)) < 2:
+    if values["objective"] == "contrastive" and float(
+        values.get("bio_learning_rate", 0)
+    ) <= 0:
+        raise ValueError("Pretraining config bio_learning_rate must be positive")
+    if values["objective"] == "contrastive" and int(values.get("batch_size", 0)) < 2:
         raise ValueError("Contrastive batch_size must be at least 2")
     if float(values.get("weight_decay", -1)) < 0:
         raise ValueError("weight_decay must be non-negative")
@@ -97,8 +109,17 @@ def validate_values(values: dict[str, Any]) -> None:
 
 
 def make_optimizer(
-    model: CTBioContrastiveModel, values: dict[str, Any]
+    model: CTBioContrastiveModel | CTBiochemistryRegressionModel,
+    values: dict[str, Any],
 ) -> torch.optim.AdamW:
+    if isinstance(model, CTBiochemistryRegressionModel):
+        return torch.optim.AdamW(
+            [
+                {"params": model.ct_encoder.parameters(), "lr": values["ct_learning_rate"]},
+                {"params": model.regression_head.parameters(), "lr": values["head_learning_rate"]},
+            ],
+            weight_decay=values["weight_decay"],
+        )
     head_parameters: list[torch.nn.Parameter] = [
         *model.ct_projector.parameters(),
         *model.bio_projector.parameters(),
@@ -116,7 +137,7 @@ def make_optimizer(
 
 
 def run_epoch(
-    model: CTBioContrastiveModel,
+    model: CTBioContrastiveModel | CTBiochemistryRegressionModel,
     loader: DataLoader,
     device: torch.device,
     *,
@@ -124,6 +145,7 @@ def run_epoch(
     scaler: torch.amp.GradScaler,
     use_amp: bool,
     gradient_clip: float,
+    objective: str,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -140,29 +162,42 @@ def run_epoch(
             for key, value in raw_batch.items()
         }
         batch_size = int(batch["ct"].shape[0])
-        if batch_size < 2:
+        if objective == "contrastive" and batch_size < 2:
             raise ValueError("InfoNCE loader produced a batch smaller than 2")
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                output = model(batch["ct"], batch["bio"], batch["bio_mask"])
-                loss, logits = symmetric_info_nce(
-                    output["z_ct"], output["z_bio"], output["temperature"]
-                )
+                if objective == "contrastive":
+                    assert isinstance(model, CTBioContrastiveModel)
+                    output = model(batch["ct"], batch["bio"], batch["bio_mask"])
+                    loss, logits = symmetric_info_nce(
+                        output["z_ct"], output["z_bio"], output["temperature"]
+                    )
+                else:
+                    assert isinstance(model, CTBiochemistryRegressionModel)
+                    prediction = model(batch["ct"])
+                    loss = masked_huber_regression_loss(
+                        prediction, batch["bio"], batch["bio_mask"]
+                    )
+                    logits = None
             if optimizer is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
                 scaler.step(optimizer)
                 scaler.update()
-        metrics = retrieval_recalls(logits.detach(), (1, 5))
+        metrics = (
+            retrieval_recalls(logits.detach(), (1, 5))
+            if logits is not None
+            else {"observed_fraction": float(batch["bio_mask"].mean().item())}
+        )
         loss_sum += float(loss.item()) * batch_size
         pair_count += batch_size
         for key, value in metrics.items():
             metric_sums[key] = metric_sums.get(key, 0.0) + value * batch_size
     if pair_count == 0:
-        raise ValueError("Pretraining loader produced no complete contrastive batches")
+        raise ValueError("Pretraining loader produced no usable batches")
     return {
         "loss": loss_sum / pair_count,
         "pairs": float(pair_count),
@@ -191,7 +226,8 @@ def main() -> None:
     if args.preflight_only:
         return
     batch_size = int(values["batch_size"])
-    if min(len(bundle.train), len(bundle.val)) < batch_size:
+    objective = str(values["objective"])
+    if objective == "contrastive" and min(len(bundle.train), len(bundle.val)) < batch_size:
         raise ValueError(
             "batch_size exceeds a pretraining split; reduce it so validation has "
             "at least one complete InfoNCE batch"
@@ -202,7 +238,7 @@ def main() -> None:
         bundle.train,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=objective == "contrastive",
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -210,7 +246,7 @@ def main() -> None:
         bundle.val,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=True,
+        drop_last=objective == "contrastive",
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -221,7 +257,12 @@ def main() -> None:
     epochs_without_improvement = 0
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if args.resume is not None:
-        model, resumed = load_checkpoint(args.resume, map_location=device)
+        if objective == "contrastive":
+            model, resumed = load_checkpoint(args.resume, map_location=device)
+        else:
+            model, resumed = load_regression_checkpoint(
+                args.resume, map_location=device
+            )
         if model.model_config != model_config:
             raise ValueError("Resume checkpoint model config differs from --config")
         optimizer = make_optimizer(model, values)
@@ -231,7 +272,11 @@ def main() -> None:
         best_validation_metric = float(resumed["best_validation_metric"])
         history = list(resumed["history"])
     else:
-        model = CTBioContrastiveModel.from_config(model_config).to(device)
+        model = (
+            CTBioContrastiveModel.from_config(model_config)
+            if objective == "contrastive"
+            else CTBiochemistryRegressionModel.from_config(model_config)
+        ).to(device)
         optimizer = make_optimizer(model, values)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +308,7 @@ def main() -> None:
             scaler=scaler,
             use_amp=use_amp,
             gradient_clip=float(values["gradient_clip"]),
+            objective=objective,
         )
         val_metrics = run_epoch(
             model,
@@ -272,6 +318,7 @@ def main() -> None:
             scaler=scaler,
             use_amp=use_amp,
             gradient_clip=float(values["gradient_clip"]),
+            objective=objective,
         )
         row = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
         history.append(row)
@@ -282,15 +329,28 @@ def main() -> None:
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-        checkpoint = build_checkpoint(
-            model,
-            optimizer,
-            scaler,
-            epoch=epoch,
-            best_validation_metric=best_validation_metric,
-            normalization_stats=bundle.normalization_stats,
-            split_provenance=bundle.preflight["split_provenance"],
-            history=history,
+        checkpoint = (
+            build_checkpoint(
+                model,
+                optimizer,
+                scaler,
+                epoch=epoch,
+                best_validation_metric=best_validation_metric,
+                normalization_stats=bundle.normalization_stats,
+                split_provenance=bundle.preflight["split_provenance"],
+                history=history,
+            )
+            if isinstance(model, CTBioContrastiveModel)
+            else build_regression_checkpoint(
+                model,
+                optimizer,
+                scaler,
+                epoch=epoch,
+                best_validation_metric=best_validation_metric,
+                normalization_stats=bundle.normalization_stats,
+                split_provenance=bundle.preflight["split_provenance"],
+                history=history,
+            )
         )
         save_checkpoint(last_path, checkpoint)
         if improved:

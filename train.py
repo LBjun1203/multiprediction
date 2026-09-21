@@ -40,7 +40,7 @@ from multidataset.huashan_dataset import (
 from multimodal_model import HuashanForecastModel
 from pretraining.checkpoint import (
     load_ct_encoder_for_forecasting,
-    validate_checkpoint as validate_pretraining_checkpoint,
+    validate_transfer_checkpoint,
 )
 
 
@@ -389,7 +389,7 @@ def main() -> None:
             )
             if not isinstance(transfer_checkpoint, dict):
                 raise ValueError("Pretraining checkpoint must contain a mapping")
-            validate_pretraining_checkpoint(transfer_checkpoint)
+            validate_transfer_checkpoint(transfer_checkpoint)
             ct_encoder_base_width = int(
                 transfer_checkpoint["model_config"].get("ct_encoder_base_width", 64)
             )

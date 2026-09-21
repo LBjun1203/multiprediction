@@ -1,0 +1,15 @@
+ct_config: ../ct/roi_3d_resnet18.yaml
+objective: regression
+ct_feature_dim: 128
+ct_encoder_base_width: 64
+ct_dropout: 0.1
+batch_size: 8
+epochs: 100
+ct_learning_rate: 0.0001
+head_learning_rate: 0.001
+weight_decay: 0.0001
+amp: true
+gradient_clip: 1.0
+seed: 42
+early_stopping_metric: validation_loss
+patience: 15

@@ -10,12 +10,21 @@ from ct_preparation.manifest import CTInputSpec
 from multimodal_model import HuashanForecastModel
 from pretraining.checkpoint import (
     build_checkpoint,
+    build_regression_checkpoint,
     load_checkpoint,
     load_ct_encoder_for_forecasting,
+    load_regression_checkpoint,
     save_checkpoint,
 )
-from pretraining.contrastive_model import CTBioContrastiveModel
-from pretraining.losses import retrieval_recalls, symmetric_info_nce
+from pretraining.contrastive_model import (
+    CTBioContrastiveModel,
+    CTBiochemistryRegressionModel,
+)
+from pretraining.losses import (
+    masked_huber_regression_loss,
+    retrieval_recalls,
+    symmetric_info_nce,
+)
 
 
 class ContrastivePretrainingTests(unittest.TestCase):
@@ -170,6 +179,53 @@ class ContrastivePretrainingTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "feature dimension"):
                 load_ct_encoder_for_forecasting(incompatible, path)
+
+    def test_regression_control_uses_masks_and_shares_transfer_contract(self) -> None:
+        spec = CTInputSpec("roi_3d", "resnet18_3d", (1, 8, 16, 16), "test-v1")
+        model = CTBiochemistryRegressionModel(
+            spec, ct_feature_dim=12, ct_encoder_base_width=2, ct_dropout=0.0
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+        target = torch.randn(2, 10)
+        mask = torch.ones(2, 10)
+        mask[0, -1] = 0
+        prediction = model(torch.rand(2, 1, 8, 16, 16))
+        loss = masked_huber_regression_loss(prediction, target, mask)
+        loss.backward()
+        optimizer.step()
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "regression.pt"
+            save_checkpoint(
+                path,
+                build_regression_checkpoint(
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch=1,
+                    best_validation_metric=float(loss.item()),
+                    normalization_stats={"source": "synthetic"},
+                    split_provenance={"source": "synthetic"},
+                    history=[],
+                ),
+            )
+            restored, checkpoint = load_regression_checkpoint(path)
+            self.assertEqual(
+                checkpoint["checkpoint_type"], "ct_bio_regression_pretraining"
+            )
+            for original, actual in zip(model.parameters(), restored.parameters()):
+                torch.testing.assert_close(actual, original, rtol=0, atol=0)
+            forecast = HuashanForecastModel(
+                ct_embedding_dim=12,
+                bio_embedding_dim=12,
+                pretrained_ct=False,
+                ct_encoder_base_width=2,
+                ct_config=spec,
+            )
+            provenance = load_ct_encoder_for_forecasting(forecast, path)
+            self.assertEqual(
+                provenance["checkpoint_type"], "ct_bio_regression_pretraining"
+            )
 
 
 if __name__ == "__main__":

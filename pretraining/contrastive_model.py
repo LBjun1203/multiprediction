@@ -158,5 +158,11 @@ class CTBiochemistryRegressionModel(nn.Module):
             "ct_dropout": ct_dropout,
         }
 
+    @classmethod
+    def from_config(
+        cls, config: Mapping[str, Any]
+    ) -> "CTBiochemistryRegressionModel":
+        return cls(**dict(config))
+
     def forward(self, ct: torch.Tensor) -> torch.Tensor:
         return self.regression_head(self.ct_encoder(ct))
