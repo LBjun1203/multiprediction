@@ -1,0 +1,4 @@
+representation: roi_3d
+encoder: resnet18_3d
+expected_shape: [1, 64, 160, 160]
+preprocessing_version: roi3d-l2l4-v1

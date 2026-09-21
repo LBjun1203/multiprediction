@@ -33,6 +33,7 @@ class HuashanForecastModel(nn.Module):
         bio_hidden_dim: int = 64,
         bio_dropout: float = 0.1,
         fusion_dropout: float = 0.1,
+        ct_encoder_base_width: int = 64,
         ct_config: CTInputSpec | Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -44,6 +45,7 @@ class HuashanForecastModel(nn.Module):
             pretrained=pretrained_ct,
             dropout=ct_dropout,
             freeze_backbone=freeze_ct_backbone,
+            base_width=ct_encoder_base_width,
         )
         self.bio_encoder = BiochemistryEncoder(
             input_dim=len(ALL_BIOMARKERS),
@@ -66,6 +68,7 @@ class HuashanForecastModel(nn.Module):
             "bio_hidden_dim": bio_hidden_dim,
             "bio_dropout": bio_dropout,
             "fusion_dropout": fusion_dropout,
+            "ct_encoder_base_width": ct_encoder_base_width,
             "ct_config": self.ct_input_spec.to_dict(),
         }
 

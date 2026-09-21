@@ -128,7 +128,7 @@ REPRESENTATIONS = {
         "roi_3d_preprocessing_version",
         "DHW",
         "CDHW",
-        ("conv3d",),
+        ("conv3d", "resnet18_3d"),
         True,
     ),
     "full_3d": RepresentationRecord(
