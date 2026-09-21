@@ -150,6 +150,8 @@ class ContrastivePretrainingTests(unittest.TestCase):
             self.assertFalse(
                 any(parameter.requires_grad for parameter in forecast.ct_encoder.parameters())
             )
+            forecast.train()
+            self.assertFalse(forecast.ct_encoder.training)
             forecast_batch = {
                 "ct": torch.rand(2, 1, 8, 16, 16),
                 "bio_base": torch.randn(2, 10),

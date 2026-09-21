@@ -39,6 +39,7 @@ class HuashanForecastModel(nn.Module):
         super().__init__()
         self._validate_contract()
         self.ct_input_spec = resolve_ct_input_spec(ct_config)
+        self._ct_encoder_fully_frozen = False
         self.ct_encoder = build_ct_encoder(
             self.ct_input_spec,
             embedding_dim=ct_embedding_dim,
@@ -111,7 +112,14 @@ class HuashanForecastModel(nn.Module):
             self.ct_encoder.eval()
         else:
             self.ct_encoder.set_transfer_policy(policy)
+        self._ct_encoder_fully_frozen = policy == "frozen"
         self.model_config["ct_transfer_policy"] = policy
+
+    def train(self, mode: bool = True) -> "HuashanForecastModel":
+        super().train(mode)
+        if self._ct_encoder_fully_frozen:
+            self.ct_encoder.eval()
+        return self
 
     def forward(
         self,

@@ -141,3 +141,87 @@ Before a real cohort run, inspect manifest/numeric metadata, all three preview
 planes, crop boundaries and padding, then run preflight and one-batch
 forward/backward. Raw CT, generated arrays, weights, and run directories must not
 be committed.
+
+## Same-timepoint CT-biochemistry pretraining
+
+Pretraining is intentionally separate from longitudinal forecasting. It learns
+associations between one baseline `roi_3d` CT and biochemistry measured at the
+same timepoint; it does not provide temporal or future-progression supervision.
+The default backbone is the native PyTorch `resnet18_3d`, while the original
+lightweight `conv3d` remains available through the CT encoder registry.
+
+The paired input is the cleaned workbook `baseline` sheet (or a CSV) with one row
+per patient, canonical `base_<biomarker>` columns, and optional
+`base_<biomarker>_mask` columns. A pretraining split CSV must contain
+`patient_id,split` with patient-level `train` and `val` assignments. Duplicate
+patients are rejected. Passing the locked downstream split automatically removes
+all downstream validation/test patients from both pretraining splits and reports
+the original overlap by downstream split.
+
+Run a read-only cohort and leakage preflight first:
+
+```bash
+python pretrain_ct_bio.py \
+  --input huashan_cleaned_7000.xlsx \
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --split-file /data/splits/pretraining_patient_split.csv \
+  --downstream-split multidataset/patient_split.csv \
+  --config configs/pretraining/ct_bio_roi3d_resnet18.yaml \
+  --preflight-only
+```
+
+After inspecting 3–5 pairs and running a small one-batch dry run, start
+contrastive pretraining by omitting `--preflight-only`. The symmetric InfoNCE
+objective jointly trains the CT and masked-biochemistry encoders. Validation
+reports CT-to-biochemistry and biochemistry-to-CT Recall@1/5 along with loss.
+Gradient accumulation, if added later, must not be interpreted as enlarging the
+in-batch negative set.
+
+```bash
+python pretrain_ct_bio.py \
+  --input huashan_cleaned_7000.xlsx \
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --split-file /data/splits/pretraining_patient_split.csv \
+  --downstream-split multidataset/patient_split.csv \
+  --config configs/pretraining/ct_bio_roi3d_resnet18.yaml \
+  --output-dir runs/ct_bio_pretrain
+
+python pretrain_ct_bio.py <same data/config arguments> \
+  --resume runs/ct_bio_pretrain/last.pt
+```
+
+`configs/pretraining/ct_bio_regression_roi3d_resnet18.yaml` selects the matched
+CT-only robust regression control. It uses the same paired Dataset, train-only
+normalization, split policy, encoder, and checkpoint/transfer boundary; loss is
+computed only for observed biochemical entries.
+
+Pretraining checkpoints store the encoder architecture and width, CT contract,
+biomarker order, normalization and split provenance, optimizer/scaler state,
+history, and RNG state. Contrastive projectors are task-specific and are never
+transferred. Initialize a new longitudinal run with only the CT encoder via:
+
+```bash
+python train.py \
+  --input multidataset/huashan_cleaned.xlsx \
+  --ct-manifest /data/huashan_ct/ct_manifest.csv \
+  --ct-root /data/huashan_ct \
+  --config configs/experiments/ct_roi3d_resnet18_seed42.yaml \
+  --ct-pretrained-checkpoint runs/ct_bio_pretrain/best.pt \
+  --ct-transfer-policy frozen
+```
+
+`--ct-pretrained-checkpoint` starts a new forecast experiment and is mutually
+exclusive with `--resume`, which still restores the complete longitudinal model,
+optimizer, epoch, and RNG state. Transfer is strict on checkpoint type/version,
+representation, encoder, expected shape, preprocessing version, feature width,
+and state-dict keys. Available policies are `frozen`, `last_stage`, and `full`;
+trainable transferred CT parameters use `--ct-learning-rate` (default `0.1x` the
+new forecast-module learning rate).
+
+For leakage-free downstream K-fold evaluation, create fold-specific pretraining
+splits that exclude that fold's validation/test patients, or use a locked external
+pretraining cohort. An encoder that has seen downstream validation/test patients
+must be labeled transductive and must not be presented as a strict held-out
+estimate.

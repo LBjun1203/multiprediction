@@ -69,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--ct-encoder-base-width", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true")
@@ -220,6 +221,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--patience and --num-workers must be non-negative")
     if args.image_size < 32:
         raise ValueError("--image-size must be at least 32")
+    if args.ct_encoder_base_width <= 0:
+        raise ValueError("--ct-encoder-base-width must be positive")
     if args.grad_clip is not None and args.grad_clip <= 0:
         raise ValueError("--grad-clip must be positive")
     if args.ct_learning_rate is not None and args.ct_learning_rate <= 0:
@@ -277,6 +280,7 @@ def main() -> None:
             "batch_size": "--batch-size",
             "learning_rate": "--learning-rate",
             "weight_decay": "--weight-decay",
+            "ct_encoder_base_width": "--ct-encoder-base-width",
         }
         for key, option in option_by_key.items():
             if key in config_values and option not in cli_options:
@@ -380,7 +384,7 @@ def main() -> None:
             )
     else:
         transfer_checkpoint: dict[str, Any] | None = None
-        ct_encoder_base_width = 64
+        ct_encoder_base_width = args.ct_encoder_base_width
         if args.ct_pretrained_checkpoint is not None:
             transfer_checkpoint = torch.load(
                 args.ct_pretrained_checkpoint,

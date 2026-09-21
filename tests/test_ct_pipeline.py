@@ -65,9 +65,13 @@ class ManifestAndConfigTests(unittest.TestCase):
     def test_versioned_experiment_configs_select_both_trainable_modes(self) -> None:
         baseline = load_experiment_config("configs/experiments/baseline_roi25d.yaml")
         volume = load_experiment_config("configs/experiments/ct_roi3d_seed42.yaml")
+        resnet_volume = load_experiment_config(
+            "configs/experiments/ct_roi3d_resnet18_seed42.yaml"
+        )
         self.assertEqual(baseline.ct.representation, "roi_25d")
         self.assertEqual(volume.ct.representation, "roi_3d")
         self.assertEqual(volume.ct.encoder, "conv3d")
+        self.assertEqual(resnet_volume.ct.encoder, "resnet18_3d")
 
     def test_legacy_aliases_and_unknown_columns_are_preserved(self) -> None:
         frame = pd.DataFrame(
