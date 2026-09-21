@@ -30,6 +30,7 @@ venv/
 /.docx_build
 /.artifact_deps
 /huashan_original_data
+/huashan_cleaned_7000.xlsx
 /runs
 
 # 模型权重

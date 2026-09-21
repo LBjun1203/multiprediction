@@ -258,13 +258,26 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if args.resume is not None:
         if objective == "contrastive":
-            model, resumed = load_checkpoint(args.resume, map_location=device)
+            model, resumed = load_checkpoint(
+                args.resume, map_location=device, restore_rng=True
+            )
         else:
             model, resumed = load_regression_checkpoint(
-                args.resume, map_location=device
+                args.resume, map_location=device, restore_rng=True
             )
         if model.model_config != model_config:
             raise ValueError("Resume checkpoint model config differs from --config")
+        if resumed["normalization_stats"] != bundle.normalization_stats:
+            raise ValueError(
+                "Resume checkpoint normalization differs from the current paired train split"
+            )
+        if (
+            resumed["pretraining_split_provenance"]
+            != bundle.preflight["split_provenance"]
+        ):
+            raise ValueError(
+                "Resume checkpoint patient split provenance differs from current inputs"
+            )
         optimizer = make_optimizer(model, values)
         optimizer.load_state_dict(resumed["optimizer_state"])
         scaler.load_state_dict(resumed["scaler_state"])
